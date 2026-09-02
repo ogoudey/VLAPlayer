@@ -1,6 +1,6 @@
 from pi import Pi05Client
-
-client = Pi05Client()
+from client import ServerConfiguration
+client = Pi05Client(remote=ServerConfiguration(ip="0.0.0.0", port=8000))
 
 from kinova import KinovaConnection
 connection = KinovaConnection(auto_detect=True)

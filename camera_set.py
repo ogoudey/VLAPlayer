@@ -6,7 +6,7 @@ import time
 import numpy as np
 import cv2
 import pyrealsense2 as rs
-
+from schemas import Vision
 
 class CameraConnection:
     POLL_HZ = 30.0
@@ -91,8 +91,17 @@ class CameraConnection:
             return frame if ok else None
 
     def get_frame(self) -> Optional[np.ndarray]:
+        """
+        General public method to get the frame. Consumed by recorders and GUI, e.g.
+        """
         with self._frame_lock:
             return self._latest_frame
+
+    def get_vision(self) -> Optional[Vision]:
+        frame = self.get_frame()
+        if frame is None:
+            return None
+        return Vision(camera_id=self.id, image=frame, timestamp=time.time())
 
     def is_connected(self) -> bool:
         return self._latest_frame is not None
@@ -105,8 +114,6 @@ class CameraConnection:
             self._pipeline.stop()
         elif self.backend == "rtsp" and self._capture is not None:
             self._capture.release()
-
-
 
 class CameraSet:
     def __init__(self, camera_connections: List[CameraConnection]):
