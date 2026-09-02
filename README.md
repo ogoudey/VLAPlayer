@@ -1,6 +1,10 @@
-# Running
+# VLA Player
+
+## Running
 ```
 python3 play.py
 ```
-# Configuring
+## Configuring
 Re-write `play.py`
+
+Aiming for Kinova...
