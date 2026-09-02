@@ -25,6 +25,17 @@ class CartesianDelta(Action):
     d_theta_z: float = 0.0  # degrees
     gripper_command: Optional[float] = None
 
+class JointVelocities7DOF(Action):
+    kind: Literal["joint_velocities_7dof"] = "joint_velocities_7dof"
+    j0: float = 0.0 # radians/sec
+    j1: float = 0.0
+    j2: float = 0.0
+    j3: float = 0.0
+    j4: float = 0.0
+    j5: float = 0.0
+    j6: float = 0.0
+    gripper_command: Optional[float] = None
+
 class Vision(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)  # needed for the np.ndarray field
 

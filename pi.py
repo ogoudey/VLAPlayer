@@ -1,6 +1,8 @@
+import math
+
 from client import Client, ServerConfiguration
 from typing import Optional
-from schemas import Observation, Vision, ActionChunk, State, Action, CartesianDelta
+from schemas import Observation, Vision, ActionChunk, State, Action, CartesianDelta, JointVelocities7DOF
 import queue
 import time
 import threading
@@ -12,6 +14,7 @@ from typing import override
 import numpy as np
 from openpi_client import image_tools
 import http
+import math
 
 @dataclass
 class Pi05ServerConfiguration(ServerConfiguration):
@@ -38,8 +41,8 @@ class Pi05ServerConfiguration(ServerConfiguration):
         self._ensure_connected()
         
         # Possibly convert to OpenPI client's schema.
-
-        payload = self._packer.pack(self._to_pi_request(observation))
+        pi_request = self._to_pi_request(observation)
+        payload = self._packer.pack(pi_request)
         try:
             self._ws.send(payload)
             response = self._ws.recv()
@@ -57,21 +60,32 @@ class Pi05ServerConfiguration(ServerConfiguration):
             # Exception` branch.
             raise RuntimeError(f"Inference server error:\n{response}")
         response_dict = msgpack_numpy.unpackb(response)
-        return self._from_pi_response(response_dict)
+        return self._to_action_chunk(response_dict)
 
-    def _from_pi_response(self, response: dict) -> ActionChunk:
+    def _to_action_chunk(self, response: dict) -> ActionChunk:
         actions = np.asarray(response["actions"])  # (chunk_size, 7)
         return ActionChunk(actions=[self._row_to_action(row) for row in actions])
 
     def _row_to_action(self, row: np.ndarray) -> CartesianDelta:
-        return CartesianDelta(
-            dx=float(row[0]), dy=float(row[1]), dz=float(row[2]),
-            d_theta_x=float(row[3]), d_theta_y=float(row[4]), d_theta_z=float(row[5]),
-            # Raw model output, roughly in [-1, 1] — NOT yet Kinova's 0-100%
-            # gripper scale, and polarity (does +1 mean open or closed?) is
-            # unconfirmed. See notes below before wiring this to hardware.
-            gripper_command=float(row[6]),
-        )
+        match self.setting:
+            case "DROID":
+                return JointVelocities7DOF(
+                    j0=float(row[0]), 
+                    j1=float(row[1]), 
+                    j2=float(row[2]),
+                    j3=float(row[3]), 
+                    j4=float(row[4]), 
+                    j5=float(row[5]),
+                    j6=float(row[6]),
+                    gripper_command=float(row[7]),
+                )
+            case "LIBERO":
+                return CartesianDelta(
+                    dx=float(row[0]), dy=float(row[1]), dz=float(row[2]),
+                    d_theta_x=float(row[3]), d_theta_y=float(row[4]), d_theta_z=float(row[5]),
+
+                    gripper_command=float(row[6]),
+                )
 
     def _to_pi_request(self, observation: Observation) -> dict:
         views = observation.vision.views
@@ -82,18 +96,49 @@ class Pi05ServerConfiguration(ServerConfiguration):
         if wrist is None or exterior is None:
             raise RuntimeError(f"Expected 'onboard' plus one other camera, got: {list(views)}")
 
-        state = np.array(observation.state.joint_angles + [0.0], dtype=np.float32)
+        match self.setting:
+            case "DROID":
+                joint_position = np.array(
+                    [math.radians(angle) for angle in observation.state.joint_angles],
+                    dtype=np.float32,
+                )
+                gripper_position = np.array([observation.state.gripper], dtype=np.float32)
 
-        return {
-            "observation/state": state,
-            "observation/image": image_tools.convert_to_uint8(
-                image_tools.resize_with_pad(exterior.image, 224, 224)
-            ),
-            "observation/wrist_image": image_tools.convert_to_uint8(
-                image_tools.resize_with_pad(wrist.image, 224, 224)
-            ),
-            "prompt": observation.language,
-        }
+                return {
+                    "observation/exterior_image_1_left": image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(exterior.image, 224, 224)
+                    ),
+                    "observation/wrist_image_left": image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(wrist.image, 224, 224)
+                    ),
+                    "observation/joint_position": joint_position,
+                    "observation/gripper_position": gripper_position,
+                    "prompt": observation.language,
+                }
+            case "LIBERO":
+                state = np.array(observation.state.joint_angles + [observation.state.gripper], dtype=np.float32)
+                return {
+                    "observation/state": state,
+                    "observation/image": image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(exterior.image, 224, 224)
+                    ),
+                    "observation/wrist_image": image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(wrist.image, 224, 224)
+                    ),
+                    "prompt": observation.language,
+                }
+            case "BASE":
+                state = np.array(observation.state.joint_angles + [observation.state.gripper], dtype=np.float32)
+                return {
+                    "observation/state": state,
+                    "observation/image": image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(exterior.image, 224, 224)
+                    ),
+                    "observation/wrist_image": image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(wrist.image, 224, 224)
+                    ),
+                    "prompt": observation.language,
+                }
     
     @override
     def test_health(self, timeout: float = 3.0) -> bool:

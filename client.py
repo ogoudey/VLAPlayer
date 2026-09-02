@@ -2,13 +2,13 @@ from exceptions import ConnectionIssue, CameraIssue
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from schemas import Observation, ActionChunk
-
+from typing import Optional
 
 @dataclass
 class ServerConfiguration(ABC):
     ip: str
     port: int
-
+    setting: Optional[str] = None
     @abstractmethod
     def make_prediction(self, observation: Observation) -> ActionChunk:
         raise NotImplementedError()

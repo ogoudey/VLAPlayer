@@ -24,7 +24,7 @@ from kortex_api.TCPTransport import TCPTransport
 from kortex_api.UDPTransport import UDPTransport
 
 from connections import Connection
-from schemas import State, Action, CartesianDelta
+from schemas import State, Action, CartesianDelta, JointVelocities7DOF
 class KortexConnection:
     IP_ADDRESS = '192.168.1.10'
     TCP_PORT = 10000
@@ -79,7 +79,7 @@ class KinovaConnection(Connection):
     HOME_ACTION_TIMEOUT_S = 20.0
 
     def __init__(self, control_period_s=0.05, max_linear_velocity=0.15,
-                 max_angular_velocity=30.0, **kwargs):
+                 max_angular_velocity=30.0, max_joint_velocity_deg_s=30.0, **kwargs):
         # Check whether arm is connected
         try:
             subprocess.run(['ping', '-c', '1',  '192.168.1.10'], check=True, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -131,6 +131,7 @@ class KinovaConnection(Connection):
         self.control_period_s = control_period_s        # expected seconds between apply_action() calls
         self.max_linear_velocity = max_linear_velocity   # m/s safety clamp
         self.max_angular_velocity = max_angular_velocity # deg/s safety clamp
+        self.max_joint_velocity_deg_s = max_joint_velocity_deg_s  # deg/s safety clamp — Kinova's own default is 30 deg/s, but the arm can do more if you want to risk it
 
     def awake(self):
         self._move_to_home()
@@ -184,6 +185,8 @@ class KinovaConnection(Connection):
     def apply_action(self, action: Action):
         if isinstance(action, CartesianDelta):
             self.handle_cartesian_delta(action)
+        elif isinstance(action, JointVelocities7DOF):
+            self.handle_joint_velocities_7dof(action)
         else:
             # No duck-typing fallback on purpose: an action type we don't
             # have an explicit handler for should fail loudly, not silently
@@ -200,6 +203,32 @@ class KinovaConnection(Connection):
         except Exception as e:
             print(f"Failed to zero out twist during pause(): {e}")
 
+    def handle_joint_velocities_7dof(self, action: JointVelocities7DOF) -> None:
+        velocities_rad_s = [action.j0, action.j1, action.j2, action.j3,
+                            action.j4, action.j5, action.j6]
+
+        if len(velocities_rad_s) != self.actuator_count:
+            # Real check, not boilerplate — Gen3 ships in both 6-DOF and 7-DOF
+            # variants, so this catches a policy/hardware mismatch immediately
+            # instead of silently sending 7 commands to a 6-joint arm.
+            raise ValueError(
+                f"Expected {self.actuator_count} joint velocities, got {len(velocities_rad_s)}"
+            )
+
+        dt = self.control_period_s
+        joint_speeds = Base_pb2.JointSpeeds()
+        for joint_id, velocity_rad_s in enumerate(velocities_rad_s):
+            speed = joint_speeds.joint_speeds.add()
+            speed.joint_identifier = joint_id
+            speed.value = self._clamp(math.degrees(velocity_rad_s), self.max_joint_velocity_deg_s)
+            speed.duration = int(dt * 1.0)
+
+        self.base.SendJointSpeedsCommand(joint_speeds)
+
+        if action.gripper_command is not None:
+            gripper_value = (action.gripper_command + 1.0) / 2.0
+            self.handle_gripper_command(gripper_value)
+
     def handle_cartesian_delta(self, action: CartesianDelta):
         dt = self.control_period_s
         twist_cmd = Base_pb2.TwistCommand()
@@ -210,7 +239,7 @@ class KinovaConnection(Connection):
         twist_cmd.twist.angular_x = self._clamp(action.d_theta_x / dt, self.max_angular_velocity)
         twist_cmd.twist.angular_y = self._clamp(action.d_theta_y / dt, self.max_angular_velocity)
         twist_cmd.twist.angular_z = self._clamp(action.d_theta_z / dt, self.max_angular_velocity)
-        twist_cmd.duration = int(dt * 3.0)
+        twist_cmd.duration = int(dt * 1.0)
 
         self.base.SendTwistCommand(twist_cmd)
 

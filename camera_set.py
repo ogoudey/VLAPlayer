@@ -58,8 +58,9 @@ class CameraConnection:
             # posted as working: github.com/Kinovarobotics/kortex/issues/88
             gst_pipeline = (
                 f"rtspsrc location={self.rtsp_url} latency=0 ! "
-                "decodebin ! videoconvert ! appsink sync=false"
+                "decodebin ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false"
             )
+            
             self._capture = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
             if not self._capture.isOpened():
                 # Falls back to OpenCV's default FFmpeg-based RTSP handling,
@@ -80,7 +81,7 @@ class CameraConnection:
                 with self._frame_lock:
                     self._latest_frame = frame
             time.sleep(period)
-
+    """
     def _read_frame(self) -> Optional[np.ndarray]:
         if self.backend == "realsense":
             frames = self._pipeline.wait_for_frames()
@@ -89,7 +90,24 @@ class CameraConnection:
         else:
             ok, frame = self._capture.read()
             return frame if ok else None
+    """
+    def _read_frame(self) -> Optional[np.ndarray]:
+        if self.backend == "realsense":
+            frames = self._pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                return None
+            frame_bgr = np.asanyarray(color_frame.get_data())
+        else:
+            ok, frame_bgr = self._capture.read()
+            if not ok:
+                return None
 
+        # Both backends hand back BGR (rs.format.bgr8 for the D435, OpenCV's
+        # default for the RTSP path) — convert once here so GUI display and
+        # the model request transforms can uniformly assume RGB.
+        return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    
     def get_frame(self) -> Optional[np.ndarray]:
         """
         General public method to get the frame. Consumed by recorders and GUI, e.g.
@@ -119,9 +137,12 @@ class CameraSet:
     def __init__(self, camera_connections: List[CameraConnection]):
         self.camera_connections = camera_connections
         self.recording = False
+
     def awake(self):
         for camera_connection in self.camera_connections:
+            print(f"[CameraSet] Awakening camera {camera_connection.id}...")
             camera_connection.awake()
+            print(f"[CameraSet] Camera {camera_connection.id} awake.")
 
     def get_vision(self) -> VisionBundle:
         views = {}
