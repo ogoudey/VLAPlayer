@@ -15,6 +15,8 @@ class Player:
 
     def awake(self):
         print(f"[Player] Awakening...")
+        self.connection.awake()
+        print(f"[Player] Connection awake.")
         self.client.awake()
         print(f"[Player] Client awake.")
         self.camera_set.awake()

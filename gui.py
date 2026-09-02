@@ -59,7 +59,7 @@ Expected duck-typed interfaces (all optional, all checked with hasattr):
 
     camera.id -> str                      # attribute, not a method
     camera.is_connected() -> bool
-    camera.latest_frame() -> np.ndarray | None   # HxWx3 uint8, or None
+    camera.get_frame() -> np.ndarray | None   # HxWx3 uint8, or None
 
 None of that is required — nothing breaks if client/connection/camera_set
 are None or don't implement these; the poller just skips them.
@@ -494,7 +494,7 @@ class GUI(UI):
         for cam in camera_set.camera_connections:
             cam_id = getattr(cam, "id", None) or str(id(cam))
             is_conn = getattr(cam, "is_connected", None)
-            get_frame = getattr(cam, "latest_frame", None)
+            get_frame = getattr(cam, "get_frame", None)
             connected = is_conn() if callable(is_conn) else None
             frame = get_frame() if callable(get_frame) else None
             self.report_camera(cam_id, frame=frame, connected=connected)
