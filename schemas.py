@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict, field_serializer
-from typing import List, Literal
+from typing import List, Literal, Optional
 import cv2
 import numpy as np
 import base64
@@ -7,8 +7,13 @@ import base64
 class Schema(BaseModel):
     pass
 
+
 class Action(Schema):
     pass
+
+class ActionChunk(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    actions: List[Action]
 
 class CartesianDelta(Action):
     kind: Literal["cartesian_delta"] = "cartesian_delta"
@@ -18,6 +23,7 @@ class CartesianDelta(Action):
     d_theta_x: float = 0.0  # degrees, in tool's local space
     d_theta_y: float = 0.0  # degrees
     d_theta_z: float = 0.0  # degrees
+    gripper_command: Optional[float] = None
 
 class Vision(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)  # needed for the np.ndarray field
@@ -36,11 +42,15 @@ class Vision(BaseModel):
             raise ValueError(f"Failed to JPEG-encode frame from camera {self.camera_id!r}")
         return base64.b64encode(buffer).decode("ascii")
 
+class VisionBundle(BaseModel):
+    views: dict[str, Vision]
+
 class State(BaseModel):
     joint_angles: List[float]  # degrees, one per actuator, base->wrist order
+    gripper: float
 
 class Observation(Schema):
-    vision: Vision
+    vision: VisionBundle
     state: State
     language: str
     

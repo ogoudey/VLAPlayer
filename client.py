@@ -1,15 +1,21 @@
 from exceptions import ConnectionIssue, CameraIssue
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from schemas import Observation
+from schemas import Observation, ActionChunk
+
 
 @dataclass
-class ServerConfiguration:
+class ServerConfiguration(ABC):
     ip: str
     port: int
 
-    def make_prediction(self, observation: Observation):
-        
+    @abstractmethod
+    def make_prediction(self, observation: Observation) -> ActionChunk:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def test_health(self, timeout: float = 3.0) -> bool:
+        raise NotImplementedError()
 
 class Client:
     """
@@ -41,6 +47,7 @@ class Client:
             raise CameraIssue("Camera set is None at Start")
 
         # start inference loop
+        print(f"Starting inference loop...")
         self.start_inference_loop()
     
     def stop_predicting(self):

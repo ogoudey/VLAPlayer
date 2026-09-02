@@ -20,3 +20,7 @@ class Connection:
     @abstractmethod
     def apply_action(self):
         pass
+
+    @abstractmethod
+    def pause(self):
+        pass

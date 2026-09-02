@@ -6,7 +6,7 @@ import time
 import numpy as np
 import cv2
 import pyrealsense2 as rs
-from schemas import Vision
+from schemas import Vision, VisionBundle
 
 class CameraConnection:
     POLL_HZ = 30.0
@@ -122,6 +122,16 @@ class CameraSet:
     def awake(self):
         for camera_connection in self.camera_connections:
             camera_connection.awake()
+
+    def get_vision(self) -> VisionBundle:
+        views = {}
+        for camera in self.camera_connections:
+            vision = camera.get_vision()
+            if vision is not None:
+                views[camera.id] = vision
+        return VisionBundle(views=views)
+
+    
 
     def start_recording(self):
         self.recording = True

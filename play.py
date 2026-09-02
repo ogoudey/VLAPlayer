@@ -1,6 +1,6 @@
 from pi import Pi05Client
-from client import ServerConfiguration
-client = Pi05Client(remote=ServerConfiguration(ip="0.0.0.0", port=8000))
+from pi import Pi05ServerConfiguration
+client = Pi05Client(remote=Pi05ServerConfiguration(ip="192.168.0.177", port=8000))
 
 from kinova import KinovaConnection
 connection = KinovaConnection(auto_detect=True)
@@ -14,6 +14,11 @@ camera_set = CameraSet([
 
 #from utilities import verify
 #verify(client=client, connection=connection, camera_set=camera_set)
+#connection.list_actions()
+
+
+
+
 
 from gui import GUI
 ui = GUI(headless=False)

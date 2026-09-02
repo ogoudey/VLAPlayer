@@ -5,7 +5,7 @@ from typing import Optional
 
 
 class UI:
-    STATIC_LANGUAGE: str = "do something useful"
+    STATIC_LANGUAGE: str = "pick up the purple block"
 
     def __init__(self, headless: bool = True, direct_start: bool = False):
         self.language = UI.STATIC_LANGUAGE
@@ -22,8 +22,8 @@ class UI:
             self.start()
 
     def start(self) -> None:
-        # This is the trigger for someone else waiting at ui.start().
-        self._start_event.set()
+        self._player.start()
+        
 
     def wait_for_start(self, timeout: Optional[float] = None) -> bool:
         """Block until start() has been called (or timeout elapses)."""

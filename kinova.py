@@ -66,8 +66,15 @@ class KortexConnection:
             self.session_manager.CloseSession(router_options)
         self.transport.disconnect()
 
+"""
+[REACH_JOINT_ANGLES] 'Retract'
+[REACH_JOINT_ANGLES] 'Home'
+[REACH_JOINT_ANGLES] 'Packaging'
+[REACH_JOINT_ANGLES] 'Zero'
+[REACH_POSE] 'pick'
+"""
 class KinovaConnection(Connection):
-    HOME_ACTION_NAME = "Home"    # factory default — check the Kinova web app's Actions list if this errors
+    HOME_ACTION_NAME = 'Retract'    # factory default — check the Kinova web app's Actions list if this errors
     FEEDBACK_POLL_HZ = 100.0
     HOME_ACTION_TIMEOUT_S = 20.0
 
@@ -146,10 +153,33 @@ class KinovaConnection(Connection):
             time.sleep(period)
         self.cyclic_running = False
 
+    def _get_gripper_position(self):
+        with self._feedback_lock:
+            feedback = self._latest_feedback
+
+        gripper_motors = feedback.interconnect.gripper_feedback.motor
+        if len(gripper_motors) == 0:
+            # Empty until the first real RefreshFeedback() comes back (or if
+            # no gripper is attached/configured). Don't silently report 0.0
+            # here — that's indistinguishable from "gripper fully open" and
+            # would feed a fabricated value into whatever policy reads it.
+            raise RuntimeError(
+                "No gripper feedback available yet — has awake() run and "
+                "completed at least one feedback refresh?"
+            )
+
+        # Kinova reports gripper position as a percentage: 0 = fully open,
+        # 100 = fully closed. Keeping that native convention here — DROID's
+        # and the base checkpoint's own conventions (which may define
+        # open/closed the opposite way, or expect [0, 1] instead of
+        # [0, 100]) belong in the per-checkpoint transform, not baked in here.
+        gripper_position = gripper_motors[0].position
+        return gripper_position
+
     def state(self) -> State:
         with self._feedback_lock:
             feedback = self._latest_feedback
-        return State(joint_angles=[actuator.position for actuator in feedback.actuators])
+        return State(joint_angles=[actuator.position for actuator in feedback.actuators], gripper=self._get_gripper_position())
     
     def apply_action(self, action: Action):
         if isinstance(action, CartesianDelta):
@@ -161,7 +191,15 @@ class KinovaConnection(Connection):
             raise TypeError(
                 f"KinovaConnection has no handler for action type {type(action).__name__!r}"
             )
-        
+    
+    def pause(self) -> None:
+        """Halt motion without touching the connection — safe to call
+        repeatedly, and safe to follow with more apply_action() calls."""
+        try:
+            self.handle_cartesian_delta(CartesianDelta())
+        except Exception as e:
+            print(f"Failed to zero out twist during pause(): {e}")
+
     def handle_cartesian_delta(self, action: CartesianDelta):
         dt = self.control_period_s
         twist_cmd = Base_pb2.TwistCommand()
@@ -172,12 +210,41 @@ class KinovaConnection(Connection):
         twist_cmd.twist.angular_x = self._clamp(action.d_theta_x / dt, self.max_angular_velocity)
         twist_cmd.twist.angular_y = self._clamp(action.d_theta_y / dt, self.max_angular_velocity)
         twist_cmd.twist.angular_z = self._clamp(action.d_theta_z / dt, self.max_angular_velocity)
-        twist_cmd.duration = dt * 3.0  # firmware stops the arm if the next action doesn't arrive in time
+        twist_cmd.duration = int(dt * 3.0)
 
         self.base.SendTwistCommand(twist_cmd)
 
-    def _clamp(value: float, limit: float) -> float:
+        if action.gripper_command is not None:
+            # PLACEHOLDER mapping, not confirmed: assumes the raw ~[-1, 1]
+            # model output is a tanh-style signal and linearly rescales it to
+            # Kinova's [0, 1] (open->closed) convention. Polarity (does the
+            # model's +1 mean open or closed?) is still unverified — test this
+            # with the gripper clear of anything before trusting it in a real
+            # grasp sequence.
+            gripper_value = (action.gripper_command + 1.0) / 2.0
+            self.handle_gripper_command(gripper_value)
+
+    def _clamp(self, value: float, limit: float) -> float:
         return max(-limit, min(limit, value))
+
+    def _clamp01(self, value: float) -> float:
+        return max(0.0, min(1.0, value))
+    
+    def handle_gripper_command(self, value_0_1: float) -> None:
+        """value_0_1: Kinova's own convention — 0.0 = fully open, 1.0 = fully closed."""
+        cmd = Base_pb2.GripperCommand()
+        cmd.mode = Base_pb2.GRIPPER_POSITION  # position mode, as opposed to speed/force
+        finger = cmd.gripper.finger.add()
+        finger.finger_identifier = 0
+        finger.value = self._clamp01(value_0_1)
+        self.base.SendGripperCommand(cmd)
+
+    def list_actions(self) -> None:
+        for action_type in (Base_pb2.REACH_JOINT_ANGLES, Base_pb2.REACH_POSE):
+            request = Base_pb2.RequestedActionType()
+            request.action_type = action_type
+            for action in self.base.ReadAllActions(request).action_list:
+                print(f"[{Base_pb2.ActionType.Name(action_type)}] {action.name!r}")
 
     def _move_to_home(self):
         action_type = Base_pb2.RequestedActionType()

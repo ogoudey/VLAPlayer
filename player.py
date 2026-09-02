@@ -37,6 +37,8 @@ class Player:
 
     def pause(self):
         print(f"[Player] Pausing.")
+        self.connection.pause()
+        print(f"[Player] Connection paused.")
         self.client.stop_predicting()
         print(f"[Player] Client stopped making predictions.")
         self.camera_set.stop_recording()
