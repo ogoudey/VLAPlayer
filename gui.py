@@ -74,7 +74,7 @@ from typing import Any, Dict, Optional
 
 import rerun as rr
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ui import UI
@@ -116,6 +116,7 @@ _PAGE_TEMPLATE = """<!doctype html>
         <div id="cameras"></div>
       </div>
       <button id="awake-btn">Awake</button>
+      <input type="text" id="prompt" placeholder="Do something useful" style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35; background: #1a1d24; color: #fff; box-sizing: border-box;" />
       <button id="start-btn">Start</button>
     </div>
   </div>
@@ -131,12 +132,18 @@ _PAGE_TEMPLATE = """<!doctype html>
     }});
 
     const btnStart = document.getElementById("start-btn");
-    btnStart.addEventListener("click", () => {{
+    const inputPrompt = document.getElementById("prompt");
+    btnStart.addEventListener("click", () => {
       btnStart.disabled = true;
-      fetch("/api/toggle", {{ method: "POST" }}).finally(() => {{
+      const promptValue = inputPrompt.value;
+      fetch("/api/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: promptValue })
+      }).finally(() => {
         btnStart.disabled = false;
-      }});
-    }});
+      });
+    });
 
 
     async function poll() {{
@@ -440,7 +447,9 @@ class GUI(UI):
                 return JSONResponse(dict(self._status))
 
         @app.post("/api/toggle")
-        def api_toggle():
+        async def api_toggle(request: Request):
+            data = await request.json()
+            self.language = data.get("prompt", "")
             self.toggle_start_pause()
             with self._status_lock:
                 return JSONResponse({"started": self._status["started"], "paused": self._status["paused"]})
