@@ -1,10 +1,10 @@
-from client import Client
+from clients.client import Client
 from ui import UI
 from typing import Optional
-from connections import Connection
+from connections.connection import Connection
 from camera_set import CameraSet
 
-from utilities import bind_camera_set_to_client, bind_connection_to_client, bind_client_to_ui, bind_connection_to_ui, bind_camera_set_to_ui
+from utilities import bind_camera_set_to_client, bind_connection_to_client, bind_client_to_ui, bind_connection_to_ui, bind_camera_set_to_ui, bind_ui_to_connection, bind_ui_to_client
 
 class Player:
     def __init__(self, client: Client, connection: Connection, camera_set: CameraSet, ui: Optional[UI]):
@@ -14,6 +14,8 @@ class Player:
         self.ui = ui
 
     def awake(self):
+        bind_ui_to_connection(self.connection, self.ui)
+        bind_ui_to_client(self.client, self.ui)
         print(f"[Player] Awakening...")
         self.connection.awake()
         print(f"[Player] Connection awake.")

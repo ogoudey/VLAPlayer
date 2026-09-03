@@ -60,9 +60,9 @@ class Pi05ServerConfiguration(ServerConfiguration):
             # Exception` branch.
             raise RuntimeError(f"Inference server error:\n{response}")
         response_dict = msgpack_numpy.unpackb(response)
-        return self._to_action_chunk(response_dict)
+        return self._from_pi_request(response_dict)
 
-    def _to_action_chunk(self, response: dict) -> ActionChunk:
+    def _from_pi_request(self, response: dict) -> ActionChunk:
         actions = np.asarray(response["actions"])
         return ActionChunk(actions=[self._row_to_action(row) for row in actions])
 
@@ -77,13 +77,13 @@ class Pi05ServerConfiguration(ServerConfiguration):
                     j4=float(row[4]), 
                     j5=float(row[5]),
                     j6=float(row[6]),
-                    gripper_command=float(row[7]),
+                    gripper_command=float((row[7] + 1.0) / 2.0),
                 )
             case "LIBERO":
                 return CartesianDelta(
                     dx=float(row[0]), dy=float(row[1]), dz=float(row[2]),
                     d_theta_x=float(row[3]), d_theta_y=float(row[4]), d_theta_z=float(row[5]),
-                    gripper_command=float(row[6]),
+                    gripper_command=float((row[6] + 1.0) / 2.0),
                 )
             case _:
                 raise ValueError(f"Setting not implemented for {self.setting}")
@@ -97,6 +97,9 @@ class Pi05ServerConfiguration(ServerConfiguration):
         if wrist is None or exterior is None:
             raise RuntimeError(f"Expected 'onboard' plus one other camera, got: {list(views)}")
 
+        exterior_image = exterior.images[exterior.historical_indices.index(0)]
+        wrist_image = wrist.images[wrist.historical_indices.index(0)]
+
         match self.setting:
             case "DROID":
                 joint_position = np.array(
@@ -107,10 +110,10 @@ class Pi05ServerConfiguration(ServerConfiguration):
 
                 return {
                     "observation/exterior_image_1_left": image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(exterior.image, 224, 224)
+                        image_tools.resize_with_pad(exterior_image, 224, 224)
                     ),
                     "observation/wrist_image_left": image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(wrist.image, 224, 224)
+                        image_tools.resize_with_pad(wrist_image, 224, 224)
                     ),
                     "observation/joint_position": joint_position,
                     "observation/gripper_position": gripper_position,
@@ -121,32 +124,21 @@ class Pi05ServerConfiguration(ServerConfiguration):
                 return {
                     "observation/state": state,
                     "observation/image": image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(exterior.image, 224, 224)
+                        image_tools.resize_with_pad(exterior_image, 224, 224)
                     ),
                     "observation/wrist_image": image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(wrist.image, 224, 224)
+                        image_tools.resize_with_pad(wrist_image, 224, 224)
                     ),
                     "prompt": observation.language,
                 }
-            case "BASE":
-                state = np.array(observation.state.joint_angles + [observation.state.gripper], dtype=np.float32)
-                return {
-                    "observation/state": state,
-                    "observation/image": image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(exterior.image, 224, 224)
-                    ),
-                    "observation/wrist_image": image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(wrist.image, 224, 224)
-                    ),
-                    "prompt": observation.language,
-                }
+
     
     @override
     def test_health(self, timeout: float = 3.0) -> bool:
         conn = http.client.HTTPConnection(self.ip, self.port, timeout=timeout)
         try:
             conn.request("GET", "/healthz")
-            return conn.getresponse().status == 200
+            return conn.getresponse().status == 200monotonic
         except OSError:
             return False
         finally:

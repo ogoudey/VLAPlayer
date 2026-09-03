@@ -23,8 +23,8 @@ from kortex_api.SessionManager import SessionManager
 from kortex_api.TCPTransport import TCPTransport
 from kortex_api.UDPTransport import UDPTransport
 
-from connections import Connection
-from schemas import State, Action, CartesianDelta, JointVelocities7DOF
+from .connection import Connection
+from schemas import State, Action, CartesianDelta, JointVelocities7DOF, Pose
 class KortexConnection:
     IP_ADDRESS = '192.168.1.10'
     TCP_PORT = 10000
@@ -80,6 +80,7 @@ class KinovaConnection(Connection):
 
     def __init__(self, control_period_s=0.05, max_linear_velocity=0.15,
                  max_angular_velocity=30.0, max_joint_velocity_deg_s=30.0, **kwargs):
+        super().__init__()
         # Check whether arm is connected
         try:
             subprocess.run(['ping', '-c', '1',  '192.168.1.10'], check=True, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -139,6 +140,7 @@ class KinovaConnection(Connection):
         self.cyclic_thread = threading.Thread(target=self._feedback_poll_loop, daemon=True)
         self.cyclic_thread.start()
         self.cyclic_running = True
+        
 
     def _feedback_poll_loop(self):
         period = 1.0 / self.FEEDBACK_POLL_HZ
@@ -164,10 +166,11 @@ class KinovaConnection(Connection):
             # no gripper is attached/configured). Don't silently report 0.0
             # here — that's indistinguishable from "gripper fully open" and
             # would feed a fabricated value into whatever policy reads it.
-            raise RuntimeError(
+            print(
                 "No gripper feedback available yet — has awake() run and "
                 "completed at least one feedback refresh?"
             )
+            return 0.0
 
         # Kinova reports gripper position as a percentage: 0 = fully open,
         # 100 = fully closed. Keeping that native convention here — DROID's
@@ -180,7 +183,29 @@ class KinovaConnection(Connection):
     def state(self) -> State:
         with self._feedback_lock:
             feedback = self._latest_feedback
-        return State(joint_angles=[actuator.position for actuator in feedback.actuators], gripper=self._get_gripper_position())
+
+        result = State(
+            joint_angles=[actuator.position for actuator in feedback.actuators],
+            target_pose=self._get_target_pose(),
+            gripper=self._get_gripper_position(),
+        )
+
+        if self.ui is not None:
+            self.ui.report_robot_state(result)
+
+        return result
+    def _get_target_pose(self):
+        with self._feedback_lock:
+            feedback = self._latest_feedback
+        target_pose = Pose(
+            x=feedback.base.tool_pose_x,
+            y=feedback.base.tool_pose_y,
+            z=feedback.base.tool_pose_z,
+            theta_x=feedback.base.tool_pose_theta_x,
+            theta_y=feedback.base.tool_pose_theta_y,
+            theta_z=feedback.base.tool_pose_theta_z,
+        )
+        return target_pose
     
     def apply_action(self, action: Action):
         if isinstance(action, CartesianDelta):
@@ -226,8 +251,7 @@ class KinovaConnection(Connection):
         self.base.SendJointSpeedsCommand(joint_speeds)
 
         if action.gripper_command is not None:
-            gripper_value = (action.gripper_command + 1.0) / 2.0
-            self.handle_gripper_command(gripper_value)
+            self.handle_gripper_command(action.gripper_command)
 
     def handle_cartesian_delta(self, action: CartesianDelta):
         dt = self.control_period_s

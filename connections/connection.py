@@ -2,6 +2,7 @@ from abc import abstractmethod
 
 class Connection:
     def __init__(self):
+        self.ui = None # For logging, visualizing
         pass
 
     @abstractmethod

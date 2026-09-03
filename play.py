@@ -1,15 +1,18 @@
-from pi import Pi05Client
-from pi import Pi05ServerConfiguration
-client = Pi05Client(remote=Pi05ServerConfiguration(ip="192.168.0.177", port=8000, setting="LIBERO"))
+#from clients.pi import Pi05Client, Pi05ServerConfiguration
+#client = Pi05Client(remote=Pi05ServerConfiguration(ip="192.168.0.177", port=8000, setting="LIBERO"))
 
-from kinova import KinovaConnection
+from clients.groot import GrootN17Client, GrootN17ServerConfiguration
+client = GrootN17Client(remote=GrootN17ServerConfiguration(ip="192.168.0.156", port=5555, embodiment_tag="OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT", timeout_ms=15000))
+
+
+from connections.kinova import KinovaConnection
 connection = KinovaConnection(auto_detect=True)
 
 
 from camera_set import CameraConnection, CameraSet
 camera_set = CameraSet([
-    CameraConnection(auto_detect=True),
-    CameraConnection(onboard_connection=connection)
+    CameraConnection(auto_detect=True, historical_indices=[-15, 0]),
+    CameraConnection(onboard_connection=connection, historical_indices=[-15, 0])
 ])
 
 #from utilities import verify

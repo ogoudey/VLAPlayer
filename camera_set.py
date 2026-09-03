@@ -1,5 +1,5 @@
 from typing import List, Optional
-from connections import Connection
+from connections.connection import Connection
 from schemas import Vision
 import threading
 import time
@@ -11,7 +11,11 @@ from schemas import Vision, VisionBundle
 class CameraConnection:
     POLL_HZ = 30.0
 
-    def __init__(self, auto_detect: bool = False, onboard_connection: Optional["Connection"] = None):
+    def __init__(self, auto_detect: bool = False, onboard_connection: Optional["Connection"] = None, historical_indices: List[int] =[0]):
+        """
+        historical_indices: List of integers indicating which frames to keep in the buffer.
+        For example, [-15, 0] means keep the most recent frame (0) and the frame from 15 frames ago (-15).
+        """
         if auto_detect and onboard_connection is not None:
             raise ValueError("Pass exactly one of auto_detect or onboard_connection, not both.")
 
@@ -19,6 +23,9 @@ class CameraConnection:
         self._latest_frame: Optional[np.ndarray] = None
         self._capture_thread: Optional[threading.Thread] = None
         self._stop_capture = threading.Event()
+        self.historical_indices = historical_indices
+        self._buffer_lock = threading.Lock()
+        self._frame_buffer: List[np.ndarray] = []  # index 0 = most recent
 
         if auto_detect:
             self.backend = "realsense"
@@ -76,21 +83,25 @@ class CameraConnection:
     def _capture_loop(self):
         period = 1.0 / self.POLL_HZ
         while not self._stop_capture.is_set():
-            frame = self._read_frame()
+            try:
+                frame = self._read_frame()
+            except Exception as e:
+                print(f"Camera {self.id} frame read failed: {e}")
+                frame = None
             if frame is not None:
                 with self._frame_lock:
-                    self._latest_frame = frame
+                    self._latest_frame = frame       # unchanged — get_frame()'s only source
+                self._push_to_buffer(frame)
             time.sleep(period)
-    """
-    def _read_frame(self) -> Optional[np.ndarray]:
-        if self.backend == "realsense":
-            frames = self._pipeline.wait_for_frames()
-            color_frame = frames.get_color_frame()
-            return np.asanyarray(color_frame.get_data()) if color_frame else None
-        else:
-            ok, frame = self._capture.read()
-            return frame if ok else None
-    """
+
+    def _push_to_buffer(self, frame: np.ndarray) -> None:
+        with self._buffer_lock:
+            self._frame_buffer.insert(0, frame)
+            # Trim anything older than the furthest-back index anyone's asked
+            # for — this is the "delete past the last index" you described.
+            oldest_needed = -min(self.historical_indices) if self.historical_indices else 0
+            del self._frame_buffer[oldest_needed + 1 :]
+
     def _read_frame(self) -> Optional[np.ndarray]:
         if self.backend == "realsense":
             frames = self._pipeline.wait_for_frames()
@@ -116,11 +127,24 @@ class CameraConnection:
             return self._latest_frame
 
     def get_vision(self) -> Optional[Vision]:
-        frame = self.get_frame()
-        if frame is None:
-            return None
-        return Vision(camera_id=self.id, image=frame, timestamp=time.time())
+        with self._buffer_lock:
+            if not self._frame_buffer:
+                return None
+            images = []
+            for idx in self.historical_indices:
+                buf_pos = -idx  # historical_indices are <= 0; buffer[0] = offset 0
+                # Not enough history yet (e.g. camera just started) — edge-pad
+                # with the oldest frame actually available, same standard
+                # approach we talked through last message.
+                images.append(self._frame_buffer[min(buf_pos, len(self._frame_buffer) - 1)])
 
+        return Vision(
+            camera_id=self.id,
+            images=images,
+            historical_indices=list(self.historical_indices),
+            timestamp=time.time(),
+        )
+    
     def is_connected(self) -> bool:
         return self._latest_frame is not None
 

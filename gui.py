@@ -73,10 +73,12 @@ import urllib.parse
 from typing import Any, Dict, Optional
 
 import rerun as rr
+import rerun.blueprint as rrb
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-
+from scipy.spatial.transform import Rotation
+from schemas import Action, State, CartesianDelta, JointVelocities7DOF
 from ui import UI
 
 _PAGE_TEMPLATE = """<!doctype html>
@@ -133,17 +135,17 @@ _PAGE_TEMPLATE = """<!doctype html>
 
     const btnStart = document.getElementById("start-btn");
     const inputPrompt = document.getElementById("prompt");
-    btnStart.addEventListener("click", () => {
+    btnStart.addEventListener("click", () => {{
       btnStart.disabled = true;
       const promptValue = inputPrompt.value;
-      fetch("/api/toggle", {
+      fetch("/api/toggle", {{
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: promptValue })
-      }).finally(() => {
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ prompt: promptValue }})
+      }}).finally(() => {{
         btnStart.disabled = false;
-      });
-    });
+      }});
+    }});
 
 
     async function poll() {{
@@ -241,6 +243,11 @@ class GUI(UI):
         self._player: Optional[Any] = None
         self._awake_fired = False
         self._start_fired = False
+        self._state_series_logged = False
+        self._action_series_logged = False
+        self._queue_depth_series_logged = False
+        self._loop_timing_series_logged = False
+        self._client_latency_series_logged = False
 
         super().__init__(headless=headless, direct_start=direct_start)
 
@@ -295,6 +302,68 @@ class GUI(UI):
             self._start_fired = True
             start()
 
+    def _log_robot_series_styles(self, num_joints: int) -> None:
+        if self._state_series_logged:
+            return
+        self._state_series_logged = True
+
+        rr.log(
+            "state/target_pose/position",
+            rr.SeriesLines(
+                names=["x (m)", "y (m)", "z (m)"],
+                interpolation_mode=rr.components.InterpolationMode.StepAfter,
+            ),
+            static=True,
+        )
+        rr.log(
+            "state/target_pose/orientation",
+            rr.SeriesLines(
+                names=["theta_x (deg)", "theta_y (deg)", "theta_z (deg)"],
+                interpolation_mode=rr.components.InterpolationMode.StepAfter,
+            ),
+            static=True,
+        )
+        rr.log(
+            "state/joint_angles",
+            rr.SeriesLines(names=[f"joint_{i} (deg)" for i in range(num_joints)],
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+        rr.log("state/gripper", rr.SeriesLines(names=["gripper (0\u20131)"],
+                                                interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True)
+
+
+    
+
+    def report_robot_state(self, state: State) -> None:
+        with self._status_lock:
+            self._status["robot_state"] = {
+                "joint_angles": list(state.joint_angles),
+                "target_pose": state.target_pose.model_dump(),
+                "gripper": state.gripper,
+            }
+        if not self._display_active:
+            return
+
+        pose = state.target_pose
+        self._log_robot_series_styles(num_joints=len(state.joint_angles))
+
+        rr.log("state/target_pose/position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("state/target_pose/orientation", rr.Scalars([pose.theta_x, pose.theta_y, pose.theta_z]))
+        rr.log("state/gripper", rr.Scalars(state.gripper))
+        rr.log("state/joint_angles", rr.Scalars(list(state.joint_angles)))
+
+        quat_xyzw = Rotation.from_euler(
+            "xyz", [pose.theta_x, pose.theta_y, pose.theta_z], degrees=True
+        ).as_quat()
+        rr.log(
+            "state/target_pose",  # unchanged — the Transform3D still lives on the parent path, not either child
+            rr.Transform3D(
+                translation=[pose.x, pose.y, pose.z],
+                quaternion=rr.Quaternion(xyzw=quat_xyzw),
+            ),
+        )
     # ------------------------------------------------------------------ #
     # start / pause / unpause — the Start button becomes a pause toggle
     # once the initial start has happened
@@ -351,12 +420,48 @@ class GUI(UI):
     # ------------------------------------------------------------------ #
     # public reporting API — call these directly, or rely on the poller
     # ------------------------------------------------------------------ #
+    def report_queue_depth(self, depth: int) -> None:
+        with self._status_lock:
+            self._status["queue_depth"] = depth
+        if not self._display_active:
+            return
+        if not self._queue_depth_series_logged:
+            self._queue_depth_series_logged = True
+            rr.log(
+                "inference/queue_depth",
+                rr.SeriesLines(names=["queue depth"], interpolation_mode=rr.components.InterpolationMode.StepAfter),
+                static=True,
+            )
+        rr.log("inference/queue_depth", rr.Scalars(depth))
+
+
+    def report_loop_timing(self, intended_period: float, actual_period: float) -> None:
+        drift_ms = (actual_period - intended_period) * 1000
+        if not self._display_active:
+            return
+        if not self._loop_timing_series_logged:
+            self._loop_timing_series_logged = True
+            rr.log(
+                "inference/loop_drift_ms",
+                rr.SeriesLines(names=["loop drift (ms)"], interpolation_mode=rr.components.InterpolationMode.Linear),
+                static=True,
+            )
+        rr.log("inference/loop_drift_ms", rr.Scalars(drift_ms))
+
+
     def report_client_latency(self, latency_ms: float) -> None:
         with self._status_lock:
             self._status["client_latency_ms"] = latency_ms
-        if self._display_active:
-            rr.log("client/latency_ms", rr.Scalars(latency_ms))
-
+        if not self._display_active:
+            return
+        if not self._client_latency_series_logged:
+            self._client_latency_series_logged = True
+            rr.log(
+                "client/latency_ms",
+                rr.SeriesLines(names=["prediction latency (ms)"], interpolation_mode=rr.components.InterpolationMode.StepAfter),
+                static=True,
+            )
+        rr.log("client/latency_ms", rr.Scalars(latency_ms))
     def report_connection_stats(self, stats: Dict[str, float], connected: Optional[bool] = None) -> None:
         with self._status_lock:
             if connected is not None:
@@ -382,13 +487,70 @@ class GUI(UI):
         if frame is not None:
             rr.log(f"cameras/{camera_id}", rr.Image(frame))
 
+    def report_loop_event(self, message: str, level: str = "info") -> None:
+        """Annotated timeline events — chunk arrivals, failures, skips — so
+        blips in the other plots can be correlated with what caused them."""
+        print(f"[inference] {message}")
+        if self._display_active:
+            rr.log("inference/events", rr.TextLog(message, level=level))
+
+    def _log_action_series_styles(self) -> None:
+        if self._action_series_logged:
+            return
+        self._action_series_logged = True
+
+        rr.log(
+            "inference/action_cartesian/position",
+            rr.SeriesLines(names=["dx (m)", "dy (m)", "dz (m)"],
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+        rr.log(
+            "inference/action_cartesian/orientation",
+            rr.SeriesLines(names=["d_theta_x (deg)", "d_theta_y (deg)", "d_theta_z (deg)"],
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+        rr.log(
+            "inference/action_cartesian/gripper",
+            rr.SeriesLines(names=["gripper_command"],
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+        rr.log(
+            "inference/action_joint",
+            rr.SeriesLines(names=["j0", "j1", "j2", "j3", "j4", "j5", "j6", "gripper_command"],
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+
+
+    def report_applied_action(self, action: "Action") -> None:
+        if not self._display_active:
+            return
+        self._log_action_series_styles()
+
+        gripper = action.gripper_command if action.gripper_command is not None else float("nan")
+
+        if isinstance(action, CartesianDelta):
+            rr.log("inference/action_cartesian/position", rr.Scalars([action.dx, action.dy, action.dz]))
+            rr.log("inference/action_cartesian/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
+            rr.log("inference/action_cartesian/gripper", rr.Scalars(gripper))
+        elif isinstance(action, JointVelocities7DOF):
+            rr.log(
+                "inference/action_joint",
+                rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6, gripper]),
+            )
     # ------------------------------------------------------------------ #
     # display setup
     # ------------------------------------------------------------------ #
     def _launch_display(self) -> None:
         rr.init(self._app_id, spawn=False)
-        server_uri = rr.serve_grpc(grpc_port=self._grpc_port, server_memory_limit="200MB")
-
+        server_uri = rr.serve_grpc(
+            grpc_port=self._grpc_port,
+            server_memory_limit="200MB",
+            default_blueprint=self._build_blueprint(),
+        )
         try:
             rr.serve_web_viewer(open_browser=False, web_port=self._web_port, connect_to=server_uri)
         except TypeError:
@@ -402,7 +564,7 @@ class GUI(UI):
         self._display_active = True
 
         app = self._build_http_app()
-        config = uvicorn.Config(app, host=self._host, port=self._http_port, log_level="info")
+        config = uvicorn.Config(app, host=self._host, port=self._http_port, log_level="warning")
         self._http_server = uvicorn.Server(config)
         self._http_thread = threading.Thread(target=self._http_server.run, daemon=True, name="gui-http")
         self._http_thread.start()
@@ -416,6 +578,27 @@ class GUI(UI):
         # and is serving (uvicorn flips Server.started once that's done),
         # not just once its thread has been launched.
         threading.Thread(target=self._wait_for_serving_then_awake, daemon=True, name="gui-await-serving").start()
+
+    
+
+    def _build_blueprint(self) -> rrb.Blueprint:
+        return rrb.Blueprint(
+            rrb.Grid(
+                
+                rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
+                rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
+                rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
+                rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                rrb.TimeSeriesView(origin="inference/action_cartesian/position", name="Action -- Cartesian Position"),
+                rrb.TimeSeriesView(origin="inference/action_cartesian/orientation", name="Action -- Cartesian Orientation"),
+                rrb.TimeSeriesView(origin="inference/action_cartesian/gripper", name="Action -- Cartesian Gripper"),
+                rrb.TimeSeriesView(origin="inference/action_joint", name="Action -- Joint"),
+                rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+            ),
+            auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+        )
 
     def _wait_for_serving_then_awake(self, timeout: float = 10.0) -> None:
         deadline = time.time() + timeout

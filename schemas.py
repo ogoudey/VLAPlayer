@@ -37,28 +37,41 @@ class JointVelocities7DOF(Action):
     gripper_command: Optional[float] = None
 
 class Vision(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)  # needed for the np.ndarray field
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     camera_id: str
-    image: np.ndarray   # BGR, HxWx3 uint8 — raw frame, used as-is for local/in-process calls
+    images: List[np.ndarray]     # List of BGR, HxWx3 uint8 — one per historical_indices entry
     timestamp: float
+    historical_indices: List[int]
 
-    @field_serializer("image", when_used="json")
-    def _encode_image(self, image: np.ndarray) -> str:
-        # Only triggers for .model_dump_json() / .model_dump(mode="json") —
-        # a local caller doing .model_dump() (python mode) or just reading
-        # `.image` directly still gets the raw array.
-        ok, buffer = cv2.imencode(".jpg", image)
-        if not ok:
-            raise ValueError(f"Failed to JPEG-encode frame from camera {self.camera_id!r}")
-        return base64.b64encode(buffer).decode("ascii")
+    @field_serializer("images", when_used="json")
+    def _encode_images(self, images: List[np.ndarray]) -> List[str]:
+        encoded = []
+        for i, image in enumerate(images):
+            ok, buffer = cv2.imencode(".jpg", image)
+            if not ok:
+                raise ValueError(
+                    f"Failed to JPEG-encode frame {i} (offset {self.historical_indices[i]}) "
+                    f"from camera {self.camera_id!r}"
+                )
+            encoded.append(base64.b64encode(buffer).decode("ascii"))
+        return encoded
 
 class VisionBundle(BaseModel):
     views: dict[str, Vision]
 
+class Pose(BaseModel):
+    x: float          # meters
+    y: float          # meters
+    z: float           # meters
+    theta_x: float     # degrees, Tait-Bryan
+    theta_y: float     # degrees
+    theta_z: float     # degrees
+
 class State(BaseModel):
-    joint_angles: List[float]  # degrees, one per actuator, base->wrist order
-    gripper: float
+    joint_angles: Optional[List[float]]  # degrees, one per actuator, base->wrist order
+    target_pose: Optional[Pose]
+    gripper: Optional[float]
 
 class Observation(Schema):
     vision: VisionBundle
