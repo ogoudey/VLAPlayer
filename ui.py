@@ -10,6 +10,8 @@ class UI:
     def __init__(self, headless: bool = True, direct_start: bool = False):
         self.language = UI.STATIC_LANGUAGE
 
+        self._player = None
+
         self.client = None          # the model client (latency to be displayed)
         self.connection = None      # the "robot" (some stats perhaps to be displayed)
         self.camera_set = None      # a set of CameraConnection objects (to be displayed)

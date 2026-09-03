@@ -63,7 +63,7 @@ class Pi05ServerConfiguration(ServerConfiguration):
         return self._to_action_chunk(response_dict)
 
     def _to_action_chunk(self, response: dict) -> ActionChunk:
-        actions = np.asarray(response["actions"])  # (chunk_size, 7)
+        actions = np.asarray(response["actions"])
         return ActionChunk(actions=[self._row_to_action(row) for row in actions])
 
     def _row_to_action(self, row: np.ndarray) -> CartesianDelta:
@@ -83,9 +83,10 @@ class Pi05ServerConfiguration(ServerConfiguration):
                 return CartesianDelta(
                     dx=float(row[0]), dy=float(row[1]), dz=float(row[2]),
                     d_theta_x=float(row[3]), d_theta_y=float(row[4]), d_theta_z=float(row[5]),
-
                     gripper_command=float(row[6]),
                 )
+            case _:
+                raise ValueError(f"Setting not implemented for {self.setting}")
 
     def _to_pi_request(self, observation: Observation) -> dict:
         views = observation.vision.views
