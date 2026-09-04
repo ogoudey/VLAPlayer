@@ -36,6 +36,15 @@ class JointVelocities7DOF(Action):
     j6: float = 0.0
     gripper_command: Optional[float] = None
 
+class PoseTarget(Action):
+    x: float          # meters
+    y: float          # meters
+    z: float           # meters
+    theta_x: float     # degrees, Tait-Bryan
+    theta_y: float     # degrees
+    theta_z: float     # degrees
+    gripper_command: Optional[float] = None
+
 class Vision(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -59,6 +68,7 @@ class Vision(BaseModel):
 
 class VisionBundle(BaseModel):
     views: dict[str, Vision]
+
 
 class Pose(BaseModel):
     x: float          # meters

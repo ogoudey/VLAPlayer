@@ -78,7 +78,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from scipy.spatial.transform import Rotation
-from schemas import Action, State, CartesianDelta, JointVelocities7DOF
+from schemas import Action, PoseTarget, State, CartesianDelta, JointVelocities7DOF
 from ui import UI
 
 _PAGE_TEMPLATE = """<!doctype html>
@@ -199,6 +199,14 @@ _PAGE_TEMPLATE = """<!doctype html>
 
 
 class GUI(UI):
+    AXIS_COLORS = {
+        "x": (230, 25, 75), # red
+        "y": (60, 180, 75), # green
+        "z": (67, 99, 216), # blue
+        "theta_x": (230, 25, 75), # red
+        "theta_y": (60, 180, 75), # green
+        "theta_z": (66, 212, 244), # blue
+    }
     def __init__(
         self,
         headless: bool = True,
@@ -210,6 +218,7 @@ class GUI(UI):
         web_port: int = 9090,
         app_id: str = "policy-inference-gui",
         poll_hz: float = 10.0,
+        client_setting: Optional[str] = None
     ):
         # IMPORTANT: UI.__init__ may call self.start() synchronously (when
         # direct_start=True), and that call lands on GUI.start() below via
@@ -221,6 +230,7 @@ class GUI(UI):
         self._web_port = web_port
         self._app_id = app_id
         self._poll_hz = poll_hz
+        self.client_setting = client_setting
 
         self._status_lock = threading.Lock()
         self._status: Dict[str, Any] = {
@@ -301,24 +311,33 @@ class GUI(UI):
         if callable(start):
             self._start_fired = True
             start()
-
+    def _pose_series_style(self, prefix: str, translation: bool) -> tuple[list[str], list[tuple[int, int, int]]]:
+        axes = ["x", "y", "z"] if translation else ["theta_x", "theta_y", "theta_z"]
+        unit = "m" if translation else "deg"
+        names = [f"{prefix} {axis} ({unit})" for axis in axes]
+        colors = [GUI.AXIS_COLORS[axis] for axis in axes]
+        return names, colors
+    
     def _log_robot_series_styles(self, num_joints: int) -> None:
         if self._state_series_logged:
             return
         self._state_series_logged = True
-
+        names, colors = self._pose_series_style("state", translation=True)
         rr.log(
             "state/target_pose/position",
             rr.SeriesLines(
-                names=["x (m)", "y (m)", "z (m)"],
+                names=names,
+                colors=colors,
                 interpolation_mode=rr.components.InterpolationMode.StepAfter,
             ),
             static=True,
         )
+        names, colors = self._pose_series_style("state", translation=False)
         rr.log(
             "state/target_pose/orientation",
             rr.SeriesLines(
-                names=["theta_x (deg)", "theta_y (deg)", "theta_z (deg)"],
+                names=names,
+                colors=colors,
                 interpolation_mode=rr.components.InterpolationMode.StepAfter,
             ),
             static=True,
@@ -494,20 +513,25 @@ class GUI(UI):
         if self._display_active:
             rr.log("inference/events", rr.TextLog(message, level=level))
 
-    def _log_action_series_styles(self) -> None:
+    def _log_action_cartesian_delta(self) -> None:
         if self._action_series_logged:
             return
         self._action_series_logged = True
 
+        names, colors = self._pose_series_style("target", translation=True)
         rr.log(
             "inference/action_cartesian/position",
-            rr.SeriesLines(names=["dx (m)", "dy (m)", "dz (m)"],
+            rr.SeriesLines(names=names,
+                            colors=colors,
                             interpolation_mode=rr.components.InterpolationMode.StepAfter),
             static=True,
         )
+        names, colors = self._pose_series_style("target", translation=False)
+
         rr.log(
             "inference/action_cartesian/orientation",
-            rr.SeriesLines(names=["d_theta_x (deg)", "d_theta_y (deg)", "d_theta_z (deg)"],
+            rr.SeriesLines(names=names,
+                            colors=colors,
                             interpolation_mode=rr.components.InterpolationMode.StepAfter),
             static=True,
         )
@@ -517,6 +541,38 @@ class GUI(UI):
                             interpolation_mode=rr.components.InterpolationMode.StepAfter),
             static=True,
         )
+
+    def _log_action_target_pose(self) -> None:
+            if self._action_series_logged:
+                return
+            self._action_series_logged = True
+            names, colors = self._pose_series_style("target", translation=True)
+            rr.log(
+                "inference/action_target_pose/position",
+                rr.SeriesLines(names=names,
+                                colors=colors,
+                                interpolation_mode=rr.components.InterpolationMode.StepAfter),
+                static=True,
+            )
+            names, colors = self._pose_series_style("target", translation=False)
+            rr.log(
+                "inference/action_target_pose/orientation",
+                rr.SeriesLines(names=names,
+                                colors=colors,
+                                interpolation_mode=rr.components.InterpolationMode.StepAfter),
+                static=True,
+            )
+            rr.log(
+                "inference/action_target_pose/gripper",
+                rr.SeriesLines(names=["gripper_command"],
+                                interpolation_mode=rr.components.InterpolationMode.StepAfter),
+                static=True,
+            )
+
+    def _log_action_joint_velocities(self) -> None:
+        if self._action_series_logged:
+            return
+        self._action_series_logged = True
         rr.log(
             "inference/action_joint",
             rr.SeriesLines(names=["j0", "j1", "j2", "j3", "j4", "j5", "j6", "gripper_command"],
@@ -528,15 +584,21 @@ class GUI(UI):
     def report_applied_action(self, action: "Action") -> None:
         if not self._display_active:
             return
-        self._log_action_series_styles()
 
         gripper = action.gripper_command if action.gripper_command is not None else float("nan")
 
         if isinstance(action, CartesianDelta):
+            self._log_action_cartesian_delta()
             rr.log("inference/action_cartesian/position", rr.Scalars([action.dx, action.dy, action.dz]))
             rr.log("inference/action_cartesian/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
             rr.log("inference/action_cartesian/gripper", rr.Scalars(gripper))
+        elif isinstance(action, PoseTarget):
+            self._log_action_target_pose()
+            rr.log("inference/action_target_pose/position", rr.Scalars([action.x, action.y, action.z]))
+            rr.log("/inference/action_target_pose/orientation", rr.Scalars([action.theta_x, action.theta_y, action.theta_z]))
+            rr.log("inference/action_target_pose/gripper", rr.Scalars(gripper))
         elif isinstance(action, JointVelocities7DOF):
+            self._log_action_joint_velocities()
             rr.log(
                 "inference/action_joint",
                 rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6, gripper]),
@@ -582,23 +644,41 @@ class GUI(UI):
     
 
     def _build_blueprint(self) -> rrb.Blueprint:
-        return rrb.Blueprint(
-            rrb.Grid(
-                
-                rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
-                rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
-                rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
-                rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                rrb.TimeSeriesView(origin="inference/action_cartesian/position", name="Action -- Cartesian Position"),
-                rrb.TimeSeriesView(origin="inference/action_cartesian/orientation", name="Action -- Cartesian Orientation"),
-                rrb.TimeSeriesView(origin="inference/action_cartesian/gripper", name="Action -- Cartesian Gripper"),
-                rrb.TimeSeriesView(origin="inference/action_joint", name="Action -- Joint"),
-                rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-            ),
-            auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-        )
+        match self.client_setting:
+            case "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT":
+                # Define the blueprint for this setting
+                return rrb.Blueprint(
+                    rrb.Grid(
+                        rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
+                        rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
+                        rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                        rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Target Pose Position"),
+                        rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Target Pose Orientation"),
+                        rrb.TimeSeriesView(origin="inference/action_target_pose/gripper", name="Action -- Target Pose Gripper"),
+                        rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                        rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                        rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                    ),
+                    auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                )
+            case _, None:
+                return rrb.Blueprint(
+                    rrb.Grid(
+                        
+                        rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
+                        rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
+                        rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
+                        rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                        rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Target Pose Position"),
+                        rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Target Pose Orientation"),
+                        rrb.TimeSeriesView(origin="inference/action_target_pose/gripper", name="Action -- Target Pose Gripper"),
+                        rrb.TimeSeriesView(origin="inference/action_joint", name="Action -- Joint"),
+                        rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                        rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                        rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                    ),
+                    auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                )
 
     def _wait_for_serving_then_awake(self, timeout: float = 10.0) -> None:
         deadline = time.time() + timeout

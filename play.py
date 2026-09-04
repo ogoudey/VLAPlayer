@@ -2,7 +2,7 @@
 #client = Pi05Client(remote=Pi05ServerConfiguration(ip="192.168.0.177", port=8000, setting="LIBERO"))
 
 from clients.groot import GrootN17Client, GrootN17ServerConfiguration
-client = GrootN17Client(remote=GrootN17ServerConfiguration(ip="192.168.0.156", port=5555, embodiment_tag="OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT", timeout_ms=15000))
+client = GrootN17Client(remote=GrootN17ServerConfiguration(ip="192.168.0.156", port=5555, setting="OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT", timeout_ms=15000))
 
 
 from connections.kinova import KinovaConnection
@@ -24,7 +24,7 @@ camera_set = CameraSet([
 
 
 from gui import GUI
-ui = GUI(headless=False)
+ui = GUI(headless=False, client_setting=client.setting)
 
 from player import Player
 player = Player(client, connection, camera_set, ui)

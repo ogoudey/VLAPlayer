@@ -5,16 +5,18 @@ from typing import Optional
 from clients.client import Client
 from clients.client import ServerConfiguration
 from typing import override
-from schemas import Action, CartesianDelta, Observation, ActionChunk, Pose
+from schemas import Action, CartesianDelta, Observation, ActionChunk, Pose, PoseTarget
 from packages.groot.server_client import PolicyClient
 from packages.groot.pose import EndEffectorPose
 from packages.groot.types import ActionFormat
 import threading
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 @dataclass
 class GrootN17ServerConfiguration(ServerConfiguration):
-    embodiment_tag: str = "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT"  # must match --embodiment-tag on the server
+    setting: str = "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT"  # must match --embodiment-tag on the server
+    EXECUTION_HORIZON = 8 # This should be editable in the GUI
     timeout_ms: int = 15000
 
     _client: Optional[PolicyClient] = field(default=None, init=False, repr=False, compare=False)
@@ -27,16 +29,13 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                 timeout_ms=self.timeout_ms,
                 strict=False,  # leave observation validation to the server
             )
-            print(f"Connected to GrootN17 server at {self.ip}:{self.port} with embodiment tag {self.embodiment_tag}")
+            print(f"Connected to GrootN17 server at {self.ip}:{self.port} with embodiment tag {self.setting}")
 
     @override
     def make_prediction(self, observation: Observation) -> ActionChunk:
         self._ensure_client()
         request = self._to_gr00t_request(observation)  # still needs grounding — see below
         action, info = self._client.get_action(request)
-        # `info` carries server-side diagnostics (timing etc.), same spirit
-        # as openpi's server_timing/policy_timing — worth logging rather
-        # than silently discarding, once you know what's actually in it.
         return self._from_gr00t_response(action)
 
     @override
@@ -95,32 +94,27 @@ class GrootN17ServerConfiguration(ServerConfiguration):
         return array[np.newaxis, np.newaxis, ...]
 
     def _from_gr00t_response(self, response: dict) -> ActionChunk:
-        eef_9d = np.asarray(response["eef_9d"])[0]                     # (T, 9) — drop batch dim
-        gripper_position = np.asarray(response["gripper_position"])[0]  # (T, 1)
-        # "joint_position" deliberately unused — see note below.
+        eef_9d_rows = np.asarray(response["eef_9d"])[0]
+        gripper_position = np.asarray(response["gripper_position"])[0]
 
-        if eef_9d.shape[0] != gripper_position.shape[0]:
-            raise RuntimeError(
-                f"eef_9d horizon ({eef_9d.shape[0]}) != gripper_position horizon "
-                f"({gripper_position.shape[0]})"
-            )
-
+        targets = [
+            EndEffectorPose.from_action_format(row, ActionFormat.XYZ_ROT6D)
+            for row in eef_9d_rows
+        ]
         return ActionChunk(actions=[
-            self._row_to_action(eef_row, gripper_row[0])
-            for eef_row, gripper_row in zip(eef_9d, gripper_position)
+            self._eef_to_pose_target(target, float(g[0]))
+            for target, g in zip(targets, gripper_position)
         ])
 
-    def _row_to_action(self, eef_9d_row: np.ndarray, gripper_value: float) -> CartesianDelta:
-        relative_pose = EndEffectorPose.from_action_format(eef_9d_row, ActionFormat.XYZ_ROT6D)
-        dx, dy, dz = relative_pose.translation
-        d_theta_x, d_theta_y, d_theta_z = relative_pose.to_rotation("euler", "xyz", degrees=True)
-
-        return CartesianDelta(
-            dx=float(dx), dy=float(dy), dz=float(dz),
-            d_theta_x=float(d_theta_x), d_theta_y=float(d_theta_y), d_theta_z=float(d_theta_z),
-            gripper_command=float(gripper_value),  # see gripper note below — do NOT reuse PI's remap on this
+    def _eef_to_pose_target(self, eef: EndEffectorPose, gripper_command: float) -> PoseTarget:
+        x, y, z = eef.translation
+        theta_x, theta_y, theta_z = eef.to_rotation("euler", "xyz", degrees=True)
+        return PoseTarget(
+            x=float(x), y=float(y), z=float(z),
+            theta_x=float(theta_x), theta_y=float(theta_y), theta_z=float(theta_z),
+            gripper_command=gripper_command,
         )
-    
+
 class GrootN17Client(Client):
     """
     Same as PI client actually
@@ -133,7 +127,10 @@ class GrootN17Client(Client):
         else:
             self.server = remote
 
-
+    @property
+    def setting(self) -> str:
+        return self.server.setting
+    
     def awake(self):
         # load the model, if it were local
         try:
@@ -169,7 +166,7 @@ class GrootN17Client(Client):
                     self.ui.report_loop_event("Prediction returned empty chunk", level="warn")
                     time_package.sleep(0.5)
                     continue
-                for action in chunk.actions:
+                for action in chunk.actions[:GrootN17ServerConfiguration.EXECUTION_HORIZON]:
                     action_queue.put(action)
                 self.ui.report_loop_event(f"Received chunk of {len(chunk.actions)} actions")
                 self.ui.report_queue_depth(action_queue.qsize())

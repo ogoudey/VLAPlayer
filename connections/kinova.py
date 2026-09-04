@@ -24,8 +24,15 @@ from kortex_api.TCPTransport import TCPTransport
 from kortex_api.UDPTransport import UDPTransport
 
 from .connection import Connection
-from schemas import State, Action, CartesianDelta, JointVelocities7DOF, Pose
+from schemas import PoseTarget, State, Action, CartesianDelta, JointVelocities7DOF, Pose
+from scipy.spatial.transform import Rotation
+
+
+
 class KortexConnection:
+    """
+    Kinova is X forward, Y left, Z up. Right-hand-rule.
+    """
     IP_ADDRESS = '192.168.1.10'
     TCP_PORT = 10000
     UDP_PORT = 10001
@@ -78,7 +85,7 @@ class KinovaConnection(Connection):
     FEEDBACK_POLL_HZ = 100.0
     HOME_ACTION_TIMEOUT_S = 20.0
 
-    def __init__(self, control_period_s=0.05, max_linear_velocity=0.15,
+    def __init__(self, control_period_s=0.0667, max_linear_velocity=0.15,
                  max_angular_velocity=30.0, max_joint_velocity_deg_s=30.0, **kwargs):
         super().__init__()
         # Check whether arm is connected
@@ -186,7 +193,7 @@ class KinovaConnection(Connection):
 
         result = State(
             joint_angles=[actuator.position for actuator in feedback.actuators],
-            target_pose=self._get_target_pose(),
+            target_pose=self._get_current_pose(),
             gripper=self._get_gripper_position(),
         )
 
@@ -194,7 +201,7 @@ class KinovaConnection(Connection):
             self.ui.report_robot_state(result)
 
         return result
-    def _get_target_pose(self):
+    def _get_current_pose(self):
         with self._feedback_lock:
             feedback = self._latest_feedback
         target_pose = Pose(
@@ -208,7 +215,29 @@ class KinovaConnection(Connection):
         return target_pose
     
     def apply_action(self, action: Action):
-        if isinstance(action, CartesianDelta):
+        if isinstance(action, PoseTarget):
+            current_pose = self._get_current_pose()
+
+            current_rotation = Rotation.from_euler(
+                "xyz", [current_pose.theta_x, current_pose.theta_y, current_pose.theta_z], degrees=True
+            )
+            target_rotation = Rotation.from_euler(
+                "xyz", [action.theta_x, action.theta_y, action.theta_z], degrees=True
+            )
+            delta_rotation = target_rotation * current_rotation.inv()
+            d_theta_x, d_theta_y, d_theta_z = delta_rotation.as_euler("xyz", degrees=True)
+
+            delta = CartesianDelta(
+                dx=action.x - current_pose.x,
+                dy=action.y - current_pose.y,
+                dz=action.z - current_pose.z,
+                d_theta_x=float(d_theta_x),
+                d_theta_y=float(d_theta_y),
+                d_theta_z=float(d_theta_z),
+                gripper_command=action.gripper_command,
+            )
+            self.handle_cartesian_delta(delta)      
+        elif isinstance(action, CartesianDelta):
             self.handle_cartesian_delta(action)
         elif isinstance(action, JointVelocities7DOF):
             self.handle_joint_velocities_7dof(action)
@@ -256,14 +285,14 @@ class KinovaConnection(Connection):
     def handle_cartesian_delta(self, action: CartesianDelta):
         dt = self.control_period_s
         twist_cmd = Base_pb2.TwistCommand()
-        twist_cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED
+        twist_cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
         twist_cmd.twist.linear_x = self._clamp(action.dx / dt, self.max_linear_velocity)
         twist_cmd.twist.linear_y = self._clamp(action.dy / dt, self.max_linear_velocity)
         twist_cmd.twist.linear_z = self._clamp(action.dz / dt, self.max_linear_velocity)
         twist_cmd.twist.angular_x = self._clamp(action.d_theta_x / dt, self.max_angular_velocity)
         twist_cmd.twist.angular_y = self._clamp(action.d_theta_y / dt, self.max_angular_velocity)
         twist_cmd.twist.angular_z = self._clamp(action.d_theta_z / dt, self.max_angular_velocity)
-        twist_cmd.duration = int(dt * 1.0)
+        twist_cmd.duration = int(dt * 3.0)
 
         self.base.SendTwistCommand(twist_cmd)
 
@@ -274,8 +303,7 @@ class KinovaConnection(Connection):
             # model's +1 mean open or closed?) is still unverified — test this
             # with the gripper clear of anything before trusting it in a real
             # grasp sequence.
-            gripper_value = (action.gripper_command + 1.0) / 2.0
-            self.handle_gripper_command(gripper_value)
+            self.handle_gripper_command(action.gripper_command)
 
     def _clamp(self, value: float, limit: float) -> float:
         return max(-limit, min(limit, value))
