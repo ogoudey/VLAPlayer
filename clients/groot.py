@@ -12,7 +12,9 @@ from packages.groot.types import ActionFormat
 import threading
 import numpy as np
 from scipy.spatial.transform import Rotation
-
+import subprocess
+import paramiko
+import os
 @dataclass
 class GrootN17ServerConfiguration(ServerConfiguration):
     setting: str = "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT"  # must match --embodiment-tag on the server
@@ -43,6 +45,45 @@ class GrootN17ServerConfiguration(ServerConfiguration):
         self._ensure_client()
         print(f"Testing health of GrootN17 server at {self.ip}:{self.port}")
         return self._client.ping()
+
+    @override
+    def ping(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "1", self.ip],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+    @override
+    def start_server(self):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        username = os.environ.get("GROOT_SERVER_USER_NAME")
+        ssh_password = os.environ.get("GROOT_SERVER_USER_PASSWORD")
+        if not username or not ssh_password:
+            raise ValueError("GROOT_SERVER_USER_NAME and GROOT_SERVER_USER_PASSWORD environment variables must be set. SEE HOW MUCH YOU NEED GND TRUTH")
+        client.connect(
+            hostname=self.ip,
+            username=username,
+            password=ssh_password,  # or password=self.password
+        )
+
+        command = "conda activate env; python3 xyz"
+
+        # Run in background via nohup so the SSH session doesn't block waiting
+        # for the server process to exit, and so it survives after we disconnect.
+        full_command = f"nohup bash -c '{command}' > /tmp/server.log 2>&1 &"
+        stdin, stdout, stderr = client.exec_command(full_command)
+
+        # exec_command returns immediately for backgrounded processes;
+        # read exit status of the launcher itself (not the server) to confirm it fired.
+        exit_status = stdout.channel.recv_exit_status()
+
+        client.close()
+        return exit_status == 0
 
     def _to_gr00t_request(self, observation: Observation):
         views = observation.vision.views
@@ -131,13 +172,6 @@ class GrootN17Client(Client):
     def setting(self) -> str:
         return self.server.setting
     
-    def awake(self):
-        # load the model, if it were local
-        try:
-            self.server.test_health()
-        except Exception as e:
-            print(f"Could not reach server: {e}")
-
     def start_inference_loop(self):
         self._stop_inference = threading.Event()
         action_queue: "queue.Queue[Action]" = queue.Queue()
