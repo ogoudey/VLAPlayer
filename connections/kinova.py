@@ -24,7 +24,7 @@ from kortex_api.TCPTransport import TCPTransport
 from kortex_api.UDPTransport import UDPTransport
 
 from .connection import Connection
-from schemas import PoseTarget, State, Action, CartesianDelta, JointVelocities7DOF, Pose
+from schemas import JointAngles, JointDelta, PoseTarget, State, Action, CartesianDelta, JointVelocities7DOF, Pose
 from scipy.spatial.transform import Rotation
 
 
@@ -85,7 +85,7 @@ class KinovaConnection(Connection):
     FEEDBACK_POLL_HZ = 100.0
     HOME_ACTION_TIMEOUT_S = 20.0
 
-    def __init__(self, control_period_s=0.0667, max_linear_velocity=0.15,
+    def __init__(self, control_period_s=0.02, max_linear_velocity=0.15,
                  max_angular_velocity=30.0, max_joint_velocity_deg_s=30.0, **kwargs):
         super().__init__()
         # Check whether arm is connected
@@ -142,7 +142,7 @@ class KinovaConnection(Connection):
         self.max_joint_velocity_deg_s = max_joint_velocity_deg_s  # deg/s safety clamp — Kinova's own default is 30 deg/s, but the arm can do more if you want to risk it
 
     def awake(self):
-        self._move_to_home()
+        self.move_to_home()
         self.kill_the_thread = False
         self.cyclic_thread = threading.Thread(target=self._feedback_poll_loop, daemon=True)
         self.cyclic_thread.start()
@@ -184,10 +184,13 @@ class KinovaConnection(Connection):
         # and the base checkpoint's own conventions (which may define
         # open/closed the opposite way, or expect [0, 1] instead of
         # [0, 100]) belong in the per-checkpoint transform, not baked in here.
-        gripper_position = gripper_motors[0].position
+        gripper_position = gripper_motors[0].position  / 100.0
         return gripper_position
 
     def state(self) -> State:
+        """
+        Check against tidybot2's get_state() and get_tool_pose()
+        """
         with self._feedback_lock:
             feedback = self._latest_feedback
 
@@ -198,9 +201,10 @@ class KinovaConnection(Connection):
         )
 
         if self.ui is not None:
-            self.ui.report_robot_state(result)
+            self.ui.report_state(result)
 
         return result
+    
     def _get_current_pose(self):
         with self._feedback_lock:
             feedback = self._latest_feedback
@@ -239,6 +243,10 @@ class KinovaConnection(Connection):
             self.handle_cartesian_delta(delta)      
         elif isinstance(action, CartesianDelta):
             self.handle_cartesian_delta(action)
+        elif isinstance(action, JointAngles):
+            self.handle_joint_angles(action)
+        elif isinstance(action, JointDelta):
+            self.handle_joint_deltas(action)
         elif isinstance(action, JointVelocities7DOF):
             self.handle_joint_velocities_7dof(action)
         else:
@@ -256,6 +264,44 @@ class KinovaConnection(Connection):
             self.handle_cartesian_delta(CartesianDelta())
         except Exception as e:
             print(f"Failed to zero out twist during pause(): {e}")
+
+    def handle_joint_angles(self, action: JointAngles) -> None:
+        angles_rad = [action.j0, action.j1, action.j2, action.j3,
+                      action.j4, action.j5, action.j6]  # length validated once at init
+
+        kortex_action = Base_pb2.Action()
+        kortex_action.name = "reach_joint_angles"
+        kortex_action.application_data = ""
+
+        for joint_id, angle_rad in enumerate(angles_rad):
+            ja = kortex_action.reach_joint_angles.joint_angles.joint_angles.add()
+            ja.joint_identifier = joint_id
+            ja.value = math.degrees(angle_rad) % 360.0  # Kortex uses [0, 360)
+
+        self.base.ExecuteAction(kortex_action)
+
+        if action.gripper_command is not None:
+            self.handle_gripper_command(action.gripper_command)
+    def handle_joint_deltas(self, action: JointDelta) -> None:
+        deltas_rad = [action.j0, action.j1, action.j2, action.j3,
+                      action.j4, action.j5, action.j6]  # length validated once at init
+
+        gain = self.ui.gain if self.ui is not None else 1.0
+        
+        dt = self.control_period_s
+        print(f"Applying joint deltas: {deltas_rad} rad over {dt} s")
+        vel_deg_s = [math.degrees(d / dt) * gain for d in deltas_rad]
+
+
+        joint_speeds = Base_pb2.JointSpeeds()
+        for joint_id, v in enumerate(vel_deg_s):
+            js = joint_speeds.joint_speeds.add()
+            js.joint_identifier = joint_id
+            js.value = v
+        self.base.SendJointSpeedsCommand(joint_speeds)
+
+        if action.gripper_command is not None:
+            self.handle_gripper_command(action.gripper_command)
 
     def handle_joint_velocities_7dof(self, action: JointVelocities7DOF) -> None:
         velocities_rad_s = [action.j0, action.j1, action.j2, action.j3,
@@ -284,32 +330,28 @@ class KinovaConnection(Connection):
 
     def handle_cartesian_delta(self, action: CartesianDelta):
         dt = self.control_period_s
+        gain = self.ui.gain if self.ui is not None else 1.0
+        print(f"Gain: {gain}, dt: {dt}, action: {action}")
         twist_cmd = Base_pb2.TwistCommand()
         twist_cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
-        twist_cmd.twist.linear_x = self._clamp(action.dx / dt, self.max_linear_velocity)
-        twist_cmd.twist.linear_y = self._clamp(action.dy / dt, self.max_linear_velocity)
-        twist_cmd.twist.linear_z = self._clamp(action.dz / dt, self.max_linear_velocity)
-        twist_cmd.twist.angular_x = self._clamp(action.d_theta_x / dt, self.max_angular_velocity)
-        twist_cmd.twist.angular_y = self._clamp(action.d_theta_y / dt, self.max_angular_velocity)
-        twist_cmd.twist.angular_z = self._clamp(action.d_theta_z / dt, self.max_angular_velocity)
+        twist_cmd.twist.linear_x = self._clamp(gain * action.dx / dt, self.max_linear_velocity)
+        twist_cmd.twist.linear_y = self._clamp(gain * action.dy / dt, self.max_linear_velocity)
+        twist_cmd.twist.linear_z = self._clamp(gain * action.dz / dt, self.max_linear_velocity)
+        twist_cmd.twist.angular_x = self._clamp(gain * action.d_theta_x / dt, self.max_angular_velocity)
+        twist_cmd.twist.angular_y = self._clamp(gain * action.d_theta_y / dt, self.max_angular_velocity)
+        twist_cmd.twist.angular_z = self._clamp(gain * action.d_theta_z / dt, self.max_angular_velocity)
         twist_cmd.duration = int(dt * 3.0)
 
         self.base.SendTwistCommand(twist_cmd)
 
         if action.gripper_command is not None:
-            # PLACEHOLDER mapping, not confirmed: assumes the raw ~[-1, 1]
-            # model output is a tanh-style signal and linearly rescales it to
-            # Kinova's [0, 1] (open->closed) convention. Polarity (does the
-            # model's +1 mean open or closed?) is still unverified — test this
-            # with the gripper clear of anything before trusting it in a real
-            # grasp sequence.
+
             self.handle_gripper_command(action.gripper_command)
 
     def _clamp(self, value: float, limit: float) -> float:
         return max(-limit, min(limit, value))
 
-    def _clamp01(self, value: float) -> float:
-        return max(0.0, min(1.0, value))
+
     
     def handle_gripper_command(self, value_0_1: float) -> None:
         """value_0_1: Kinova's own convention — 0.0 = fully open, 1.0 = fully closed."""
@@ -317,7 +359,7 @@ class KinovaConnection(Connection):
         cmd.mode = Base_pb2.GRIPPER_POSITION  # position mode, as opposed to speed/force
         finger = cmd.gripper.finger.add()
         finger.finger_identifier = 0
-        finger.value = self._clamp01(value_0_1)
+        finger.value = self._clamp(value_0_1, 1.0)  # Kinova's own convention — 0 = fully open, 100 = fully closed
         self.base.SendGripperCommand(cmd)
 
     def list_actions(self) -> None:
@@ -327,7 +369,10 @@ class KinovaConnection(Connection):
             for action in self.base.ReadAllActions(request).action_list:
                 print(f"[{Base_pb2.ActionType.Name(action_type)}] {action.name!r}")
 
-    def _move_to_home(self):
+    def move_to_home(self):
+        self.base.ClearFaults()
+        self._wait_until_ready(timeout=3)
+        self._gripper_position_command(0.0)
         action_type = Base_pb2.RequestedActionType()
         action_type.action_type = Base_pb2.REACH_JOINT_ANGLES
         action_list = self.base.ReadAllActions(action_type)
@@ -350,6 +395,23 @@ class KinovaConnection(Connection):
         if not reached:
             raise RuntimeError("Timed out waiting for arm to reach Home position.")
 
+    def _gripper_position_command(self, value):
+        # Send gripper command
+        gripper_command = Base_pb2.GripperCommand()
+        gripper_command.mode = Base_pb2.GRIPPER_POSITION
+        finger = gripper_command.gripper.finger.add()
+        finger.value = value
+        self.base.SendGripperCommand(gripper_command)
+
+        # Wait for reported position to match value
+        gripper_request = Base_pb2.GripperRequest()
+        gripper_request.mode = Base_pb2.GRIPPER_POSITION
+        while True:
+            gripper_measure = self.base.GetMeasuredGripperMovement(gripper_request)
+            if abs(value - gripper_measure.finger[0].value) < 0.01:
+                break
+            time.sleep(0.01)
+
     def _feedback_poll_loop(self):
         period = 1.0 / self.FEEDBACK_POLL_HZ
         while not self.kill_the_thread:
@@ -364,3 +426,15 @@ class KinovaConnection(Connection):
             time.sleep(period)
         self.cyclic_running = False
 
+    def _wait_until_ready(self, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        last_state = None
+        while time.time() < deadline:
+            arm_state = self.base.GetArmState()
+            last_state = arm_state.active_state
+            if last_state == Common_pb2.ARMSTATE_SERVOING_READY:
+                return
+            time.sleep(0.05)
+
+        state_name = Common_pb2.ArmState.Name(last_state) if last_state is not None else "UNKNOWN"
+        

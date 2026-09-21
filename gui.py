@@ -71,14 +71,15 @@ import threading
 import time
 import urllib.parse
 from typing import Any, Dict, Optional
+import uuid
 
 import rerun as rr
 import rerun.blueprint as rrb
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from scipy.spatial.transform import Rotation
-from schemas import Action, PoseTarget, State, CartesianDelta, JointVelocities7DOF
+from schemas import Action, JointAngles, PoseTarget, State, CartesianDelta, JointVelocities7DOF, JointDelta
 from ui import UI
 
 _PAGE_TEMPLATE = """<!doctype html>
@@ -118,8 +119,15 @@ _PAGE_TEMPLATE = """<!doctype html>
         <div id="cameras"></div>
       </div>
       <button id="awake-btn">Awake</button>
-      <input type="text" id="prompt" placeholder="Do something useful" style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35; background: #1a1d24; color: #fff; box-sizing: border-box;" />
+      <input type="text" id="prompt" placeholder="clear the table" style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35; background: #1a1d24; color: #fff; box-sizing: border-box;" />
+      <label style="font-size: 13px; color: #c4c9d4;">gain
+        <input type="number" id="gain" value="1.0" step="0.05" min="0" max="2"
+                style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35;
+                        background: #1a1d24; color: #fff; box-sizing: border-box; width: 100%; margin-top: 4px;" />
+        </label>
       <button id="start-btn">Start</button>
+
+      <button id="gohome-btn" style="display:none; background:#6b5ce6;">Go To Home</button>
     </div>
   </div>
   <script>
@@ -135,6 +143,18 @@ _PAGE_TEMPLATE = """<!doctype html>
 
     const btnStart = document.getElementById("start-btn");
     const inputPrompt = document.getElementById("prompt");
+    const inputGain = document.getElementById("gain");
+    inputGain.addEventListener("change", () => {{
+        const value = parseFloat(inputGain.value);
+        if (!isNaN(value)) {{
+            fetch("/api/gain", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ gain: value }}),
+            }});
+        }}
+    }});
+
     btnStart.addEventListener("click", () => {{
       btnStart.disabled = true;
       const promptValue = inputPrompt.value;
@@ -147,17 +167,31 @@ _PAGE_TEMPLATE = """<!doctype html>
       }});
     }});
 
+    const btnGoHome = document.getElementById("gohome-btn");
+        btnGoHome.addEventListener("click", () => {{
+        btnGoHome.disabled = true;
+        fetch("/api/go_home", {{ method: "POST" }}).catch(() => {{
+            btnGoHome.disabled = false;
+        }});
+    }});
+
+    let lastInstanceId = null;
 
     async function poll() {{
       try {{
         const r = await fetch("/api/status");
         const s = await r.json();
 
+        if (lastInstanceId !== null && s.instance_id !== lastInstanceId) {{
+            location.reload();
+            return;  // don't bother running the rest of this poll — page is about to reload
+        }}
+        lastInstanceId = s.instance_id;
+        
         if (s.awake) {{
             btnAwake.disabled = true;
             btnAwake.textContent = "Awakened";
         }}
-
 
         if (!s.started) {{
             btnStart.textContent = "Start";
@@ -170,7 +204,17 @@ _PAGE_TEMPLATE = """<!doctype html>
             btnStart.disabled = false;
         }}
 
+        if (s.started) {{
+            btnGoHome.style.display = "block";
+            btnGoHome.disabled = s.going_home;
+            btnGoHome.textContent = s.going_home ? "Going home..." : "Go To Home";
+        }} else {{
+            btnGoHome.style.display = "none";
+        }}
 
+        if (document.activeElement !== inputGain) {{
+            inputGain.value = s.gain;
+        }}
         
         const dot = document.getElementById("conn-dot");
         const connText = document.getElementById("conn-text");
@@ -218,7 +262,8 @@ class GUI(UI):
         web_port: int = 9090,
         app_id: str = "policy-inference-gui",
         poll_hz: float = 10.0,
-        client_setting: Optional[str] = None
+        client_setting: Optional[str] = None,
+        recording_path: str = "data"
     ):
         # IMPORTANT: UI.__init__ may call self.start() synchronously (when
         # direct_start=True), and that call lands on GUI.start() below via
@@ -230,13 +275,17 @@ class GUI(UI):
         self._web_port = web_port
         self._app_id = app_id
         self._poll_hz = poll_hz
+        self.gain: float = 1.0
         self.client_setting = client_setting
-
+        self._instance_id = str(uuid.uuid4())
         self._status_lock = threading.Lock()
         self._status: Dict[str, Any] = {
+            "instance_id": self._instance_id,
             "awake": False,
             "started": False,
             "paused": False,
+            "going_home": False,
+            "gain": 1.0,
             "client_latency_ms": None,
             "connection": {"connected": False, "stats": {}},
             "cameras": {},
@@ -262,7 +311,12 @@ class GUI(UI):
         super().__init__(headless=headless, direct_start=direct_start)
 
         if not self.headless:
-            self._launch_display()
+            self._launch_display(recording_path)
+
+    @property
+    def _actively_predicting(self) -> bool:
+        with self._status_lock:
+            return self._status["started"] and not self._status["paused"]
 
     # ------------------------------------------------------------------ #
     # trigger
@@ -274,10 +328,14 @@ class GUI(UI):
             already = self._status["started"]
             with self._status_lock:
                 self._status["started"] = True
+            self.clear_live_display()
             if not already and self._display_active:
                 rr.log("/gui/events", rr.TextLog("Start triggered"))
         super().start()
 
+    def clear_live_display(self) -> None:
+        if self._display_active:
+            rr.log("/", rr.Clear(recursive=True))
     # ------------------------------------------------------------------ #
     # player wiring — GUI fires awake()/start() on the player itself
     # ------------------------------------------------------------------ #
@@ -296,21 +354,7 @@ class GUI(UI):
             self._status["awake"] = True
         rr.log("/gui/events", rr.TextLog("Awake triggered"))
 
-    def _fire_awake(self) -> None:
-        if self._awake_fired or self._player is None:
-            return
-        awake = getattr(self._player, "awake", None)
-        if callable(awake):
-            self._awake_fired = True
-            awake()
-
-    def _fire_player_start(self) -> None:
-        if self._start_fired or self._player is None:
-            return
-        start = getattr(self._player, "start", None)
-        if callable(start):
-            self._start_fired = True
-            start()
+    
     def _pose_series_style(self, prefix: str, translation: bool) -> tuple[list[str], list[tuple[int, int, int]]]:
         axes = ["x", "y", "z"] if translation else ["theta_x", "theta_y", "theta_z"]
         unit = "m" if translation else "deg"
@@ -355,34 +399,65 @@ class GUI(UI):
 
     
 
-    def report_robot_state(self, state: State) -> None:
+    def report_state(self, state: State) -> None:
         with self._status_lock:
             self._status["robot_state"] = {
                 "joint_angles": list(state.joint_angles),
                 "target_pose": state.target_pose.model_dump(),
                 "gripper": state.gripper,
             }
-        if not self._display_active:
+
+        if not self._display_active or not self._actively_predicting:
             return
 
-        pose = state.target_pose
-        self._log_robot_series_styles(num_joints=len(state.joint_angles))
+        if self.client_setting == "NEW_EMBODIMENT":
+            self._log_robot_series_styles(num_joints=len(state.joint_angles))
+            rr.log("state/joint_angles", rr.Scalars(list(state.joint_angles)))
+            rr.log("state/gripper", rr.Scalars(state.gripper))
+        else:  
+            pose = state.target_pose
+            self._log_robot_series_styles(num_joints=len(state.joint_angles))
 
-        rr.log("state/target_pose/position", rr.Scalars([pose.x, pose.y, pose.z]))
-        rr.log("state/target_pose/orientation", rr.Scalars([pose.theta_x, pose.theta_y, pose.theta_z]))
-        rr.log("state/gripper", rr.Scalars(state.gripper))
-        rr.log("state/joint_angles", rr.Scalars(list(state.joint_angles)))
+            
+            rr.log("state/target_pose/position", rr.Scalars([pose.x, pose.y, pose.z]))
+            rr.log("state/target_pose/orientation", rr.Scalars([pose.theta_x, pose.theta_y, pose.theta_z]))
+            rr.log("state/gripper", rr.Scalars(state.gripper))
+            rr.log("state/joint_angles", rr.Scalars(list(state.joint_angles)))
 
-        quat_xyzw = Rotation.from_euler(
-            "xyz", [pose.theta_x, pose.theta_y, pose.theta_z], degrees=True
-        ).as_quat()
-        rr.log(
-            "state/target_pose",  # unchanged — the Transform3D still lives on the parent path, not either child
-            rr.Transform3D(
-                translation=[pose.x, pose.y, pose.z],
-                quaternion=rr.Quaternion(xyzw=quat_xyzw),
-            ),
-        )
+            quat_xyzw = Rotation.from_euler(
+                "xyz", [pose.theta_x, pose.theta_y, pose.theta_z], degrees=True
+            ).as_quat()
+            rr.log(
+                "state/target_pose",  # unchanged — the Transform3D still lives on the parent path, not either child
+                rr.Transform3D(
+                    translation=[pose.x, pose.y, pose.z],
+                    quaternion=rr.Quaternion(xyzw=quat_xyzw),
+                ),
+            )
+
+    
+    def go_home(self) -> None:
+        with self._status_lock:
+            if self._status["going_home"]:
+                return  # already in progress — ignore a duplicate click
+            was_paused = self._status["paused"]
+            self._status["going_home"] = True
+        if self._display_active:
+            rr.log("/gui/events", rr.TextLog("go_home() triggered"))
+        self.clear_live_display()
+        # Don't let the policy command motion while the arm is homing.
+        self.pause()
+        threading.Thread(
+            target=self._go_home_and_resume, args=(was_paused,), daemon=True, name="gui-player-go-home"
+        ).start()
+
+    def _go_home_and_resume(self, was_paused: bool) -> None:
+        self.connection.move_to_home()
+        with self._status_lock:
+            self._status["going_home"] = False
+        if not was_paused:
+            self.unpause()
+    
     # ------------------------------------------------------------------ #
     # start / pause / unpause — the Start button becomes a pause toggle
     # once the initial start has happened
@@ -421,20 +496,35 @@ class GUI(UI):
             rr.log("/gui/events", rr.TextLog("unpause() triggered"))
         self._fire_player_unpause()
  
+    def _fire_awake(self) -> None:
+        if self._awake_fired or self._player is None:
+            return
+        awake = getattr(self._player, "awake", None)
+        if callable(awake):
+            self._awake_fired = True
+            threading.Thread(target=awake, daemon=True, name="gui-player-awake").start()
+
+    def _fire_player_start(self) -> None:
+        if self._start_fired or self._player is None:
+            return
+        start = getattr(self._player, "start", None)
+        if callable(start):
+            self._start_fired = True
+            threading.Thread(target=start, daemon=True, name="gui-player-start").start()
+
     def _fire_player_pause(self) -> None:
         if self._player is None:
             return
         pause = getattr(self._player, "pause", None)
         if callable(pause):
-            pause()
- 
+            threading.Thread(target=pause, daemon=True, name="gui-player-pause").start()
+
     def _fire_player_unpause(self) -> None:
         if self._player is None:
             return
         unpause = getattr(self._player, "unpause", None)
         if callable(unpause):
-            unpause()
-
+            threading.Thread(target=unpause, daemon=True, name="gui-player-unpause").start()
 
     # ------------------------------------------------------------------ #
     # public reporting API — call these directly, or rely on the poller
@@ -442,7 +532,7 @@ class GUI(UI):
     def report_queue_depth(self, depth: int) -> None:
         with self._status_lock:
             self._status["queue_depth"] = depth
-        if not self._display_active:
+        if not self._display_active or not self._actively_predicting:
             return
         if not self._queue_depth_series_logged:
             self._queue_depth_series_logged = True
@@ -456,7 +546,7 @@ class GUI(UI):
 
     def report_loop_timing(self, intended_period: float, actual_period: float) -> None:
         drift_ms = (actual_period - intended_period) * 1000
-        if not self._display_active:
+        if not self._display_active or not self._actively_predicting:
             return
         if not self._loop_timing_series_logged:
             self._loop_timing_series_logged = True
@@ -471,7 +561,7 @@ class GUI(UI):
     def report_client_latency(self, latency_ms: float) -> None:
         with self._status_lock:
             self._status["client_latency_ms"] = latency_ms
-        if not self._display_active:
+        if not self._display_active or not self._actively_predicting:
             return
         if not self._client_latency_series_logged:
             self._client_latency_series_logged = True
@@ -486,7 +576,7 @@ class GUI(UI):
             if connected is not None:
                 self._status["connection"]["connected"] = connected
             self._status["connection"]["stats"].update(stats)
-        if not self._display_active:
+        if not self._display_active or not self._actively_predicting:
             return
         if connected is not None:
             rr.log("connection/connected", rr.Scalars(1.0 if connected else 0.0))
@@ -501,7 +591,7 @@ class GUI(UI):
                 entry["connected"] = connected
             if frame is not None:
                 entry["last_frame_ts"] = time.time()
-        if not self._display_active:
+        if not self._display_active or not self._actively_predicting:
             return
         if frame is not None:
             rr.log(f"cameras/{camera_id}", rr.Image(frame))
@@ -510,7 +600,7 @@ class GUI(UI):
         """Annotated timeline events — chunk arrivals, failures, skips — so
         blips in the other plots can be correlated with what caused them."""
         print(f"[inference] {message}")
-        if self._display_active:
+        if self._display_active or not self._actively_predicting:
             rr.log("inference/events", rr.TextLog(message, level=level))
 
     def _log_action_cartesian_delta(self) -> None:
@@ -569,6 +659,23 @@ class GUI(UI):
                 static=True,
             )
 
+    def _log_action_joint_angles(self) -> None:
+        if self._action_series_logged:
+            return
+        self._action_series_logged = True
+        rr.log(
+            "inference/action_joint_angles/joint_angles",
+            rr.SeriesLines(names=["j0", "j1", "j2", "j3", "j4", "j5", "j6"],
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+        rr.log(
+            "inference/action_joint_angles/gripper",
+            rr.SeriesLines(names=["gripper_command"],
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+        
     def _log_action_joint_velocities(self) -> None:
         if self._action_series_logged:
             return
@@ -582,7 +689,7 @@ class GUI(UI):
 
 
     def report_applied_action(self, action: "Action") -> None:
-        if not self._display_active:
+        if not self._display_active or not self._actively_predicting:
             return
 
         gripper = action.gripper_command if action.gripper_command is not None else float("nan")
@@ -597,6 +704,14 @@ class GUI(UI):
             rr.log("inference/action_target_pose/position", rr.Scalars([action.x, action.y, action.z]))
             rr.log("/inference/action_target_pose/orientation", rr.Scalars([action.theta_x, action.theta_y, action.theta_z]))
             rr.log("inference/action_target_pose/gripper", rr.Scalars(gripper))
+        elif isinstance(action, JointDelta):
+            self._log_action_joint_deltas()
+            rr.log("inference/action_joint_deltas/position", rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6]))
+            rr.log("inference/action_joint_deltas/gripper", rr.Scalars(gripper))
+        elif isinstance(action, JointAngles):
+            self._log_action_joint_angles()
+            rr.log("inference/action_joint_angles/joint_angles", rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6]))
+            rr.log("inference/action_joint_angles/gripper", rr.Scalars(gripper))
         elif isinstance(action, JointVelocities7DOF):
             self._log_action_joint_velocities()
             rr.log(
@@ -606,8 +721,9 @@ class GUI(UI):
     # ------------------------------------------------------------------ #
     # display setup
     # ------------------------------------------------------------------ #
-    def _launch_display(self) -> None:
+    def _launch_display(self, recording_path: str) -> None:
         rr.init(self._app_id, spawn=False)
+        rr.save(recording_path)
         server_uri = rr.serve_grpc(
             grpc_port=self._grpc_port,
             server_memory_limit="200MB",
@@ -655,6 +771,36 @@ class GUI(UI):
                         rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Target Pose Position"),
                         rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Target Pose Orientation"),
                         rrb.TimeSeriesView(origin="inference/action_target_pose/gripper", name="Action -- Target Pose Gripper"),
+                        rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                        rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                        rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                    ),
+                    auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                )
+            case "OLD_NEW_EMBODIMENT":
+                # Define the blueprint for this setting
+                return rrb.Blueprint(
+                    rrb.Grid(
+                        rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
+                        rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
+                        rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                        rrb.TimeSeriesView(origin="inference/action_cartesian/position", name="Action -- Target Pose Position"),
+                        rrb.TimeSeriesView(origin="inference/action_cartesian/orientation", name="Action -- Target Pose Orientation"),
+                        rrb.TimeSeriesView(origin="inference/action_cartesian/gripper", name="Action -- Target Pose Gripper"),
+                        rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                        rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                        rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                    ),
+                    auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                )
+            case "NEW_EMBODIMENT":
+                # Define the blueprint for this setting
+                return rrb.Blueprint(
+                    rrb.Grid(
+                        rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
+                        rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                        rrb.TimeSeriesView(origin="inference/action_joint_angles/joint_angles", name="Action -- Joint Angles"),
+                        rrb.TimeSeriesView(origin="inference/action_joint_angles/gripper", name="Action --  Gripper"),
                         rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
                         rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
                         rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
@@ -710,13 +856,28 @@ class GUI(UI):
                 return JSONResponse(dict(self._status))
 
         @app.post("/api/toggle")
-        async def api_toggle(request: Request):
-            data = await request.json()
-            self.language = data.get("prompt", "")
+        def api_toggle(payload: dict = Body(...)):
+            self.language = payload.get("prompt", "")
             self.toggle_start_pause()
             with self._status_lock:
                 return JSONResponse({"started": self._status["started"], "paused": self._status["paused"]})
 
+        @app.post("/api/go_home")
+        def api_go_home():
+            self.go_home()
+            with self._status_lock:
+                return JSONResponse({"going_home": self._status["going_home"]})
+
+        @app.post("/api/gain")
+        def api_gain(payload: dict = Body(...)):
+            try:
+                value = float(payload.get("gain", 1.0))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "invalid gain"}, status_code=400)
+            self.gain = value
+            with self._status_lock:
+                self._status["gain"] = value
+            return JSONResponse({"gain": value})
 
         return app
 

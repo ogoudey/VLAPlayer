@@ -60,9 +60,9 @@ class Pi05ServerConfiguration(ServerConfiguration):
             # Exception` branch.
             raise RuntimeError(f"Inference server error:\n{response}")
         response_dict = msgpack_numpy.unpackb(response)
-        return self._from_pi_request(response_dict)
+        return self._from_pi_response(response_dict)
 
-    def _from_pi_request(self, response: dict) -> ActionChunk:
+    def _from_pi_response(self, response: dict) -> ActionChunk:
         actions = np.asarray(response["actions"])
         return ActionChunk(actions=[self._row_to_action(row) for row in actions])
 
