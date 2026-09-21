@@ -1,4 +1,5 @@
 import math
+import os
 
 from client import Client, ServerConfiguration
 from typing import Optional
@@ -15,6 +16,8 @@ import numpy as np
 from openpi_client import image_tools
 import http
 import math
+import paramiko
+import subprocess
 
 @dataclass
 class Pi05ServerConfiguration(ServerConfiguration):
@@ -131,7 +134,7 @@ class Pi05ServerConfiguration(ServerConfiguration):
                     ),
                     "prompt": observation.language,
                 }
-
+    
     
     @override
     def test_health(self, timeout: float = 3.0) -> bool:
@@ -144,6 +147,46 @@ class Pi05ServerConfiguration(ServerConfiguration):
         finally:
             conn.close()
 
+    @override
+    def ping(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "1", self.ip],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+            
+
+    @override
+    def start_server(self):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        username = os.environ.get("GROOT_SERVER_USER_NAME")
+        ssh_password = os.environ.get("GROOT_SERVER_USER_PASSWORD")
+        if not username or not ssh_password:
+            raise ValueError("GROOT_SERVER_USER_NAME and GROOT_SERVER_USER_PASSWORD environment variables must be set. SEE HOW MUCH YOU NEED GND TRUTH")
+        client.connect(
+            hostname=self.ip,
+            username=username,
+            password=ssh_password,  # or password=self.password
+        )
+
+        command = "conda activate env; python3 xyz"
+
+        # Run in background via nohup so the SSH session doesn't block waiting
+        # for the server process to exit, and so it survives after we disconnect.
+        full_command = f"nohup bash -c '{command}' > /tmp/server.log 2>&1 &"
+        stdin, stdout, stderr = client.exec_command(full_command)
+
+        # exec_command returns immediately for backgrounded processes;
+        # read exit status of the launcher itself (not the server) to confirm it fired.
+        exit_status = stdout.channel.recv_exit_status()
+
+        client.close()
+        return exit_status == 0
     def close(self):
         if self._ws is not None:
             self._ws.close()

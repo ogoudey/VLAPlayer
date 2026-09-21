@@ -9,3 +9,4 @@ msgpack
 msgpack_numpy
 zmq
 scipy
+paramiko

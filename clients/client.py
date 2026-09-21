@@ -17,10 +17,19 @@ class ServerConfiguration(ABC):
     def test_health(self, timeout: float = 3.0) -> bool:
         raise NotImplementedError()
 
+    @abstractmethod
+    def ping(self) -> bool:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def start_server(self):
+        raise NotImplementedError()
+    
 class Client:
     """
     A client of a VLA.
     """
+    server: ServerConfiguration
     def __init__(self):
         self.connection = None
         self.camera_set = None
@@ -28,10 +37,22 @@ class Client:
 
         self.predicting = True
 
-    @abstractmethod
+    
     def awake(self):
-        # load the model
-        pass
+        # load the model, if it were local
+        self.server.ping()
+        if not self.server.test_health():
+            self.server.start_server()
+            while not self.server.test_health():
+                print(f"Waiting for server to start...")
+                import time
+                time.sleep(1)
+        
+        try:
+            self.server.test_health()
+        except Exception as e:
+            print(f"Could not reach server: {e}")
+
 
     @abstractmethod
     def start_inference_loop(self):
