@@ -8,7 +8,7 @@ from typing import Optional
 class ServerConfiguration(ABC):
     ip: str
     port: int
-    setting: Optional[str] = None
+    #setting: Optional[str] = None
     @abstractmethod
     def make_prediction(self, observation: Observation) -> ActionChunk:
         raise NotImplementedError()

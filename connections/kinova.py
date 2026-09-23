@@ -351,8 +351,25 @@ class KinovaConnection(Connection):
     def _clamp(self, value: float, limit: float) -> float:
         return max(-limit, min(limit, value))
 
+    def get_gripper_position(self) -> float:
+        """Measured gripper position, 0.0 = open, 1.0 = closed."""
+        req = Base_pb2.GripperRequest()
+        req.mode = Base_pb2.GRIPPER_POSITION
+        meas = self.base.GetMeasuredGripperMovement(req)
+        return meas.finger[0].value if len(meas.finger) else 0.0
 
-    
+    def handle_gripper_delta(self, gripper_delta: float, scale: float = 1.0,
+                            deadband: float = 1e-3) -> None:
+        # Initialize the target from the real gripper state the first time
+        if getattr(self, "_gripper_target", None) is None:
+            self._gripper_target = self.get_gripper_position()
+
+        if abs(gripper_delta) < deadband:
+            return  # avoid spamming tiny commands
+
+        self._gripper_target = self._clamp(self._gripper_target + scale * gripper_delta, 1.0)
+        self.handle_gripper_command(self._gripper_target)
+
     def handle_gripper_command(self, value_0_1: float) -> None:
         """value_0_1: Kinova's own convention — 0.0 = fully open, 1.0 = fully closed."""
         cmd = Base_pb2.GripperCommand()

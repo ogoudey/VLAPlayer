@@ -82,6 +82,8 @@ from scipy.spatial.transform import Rotation
 from schemas import Action, JointAngles, PoseTarget, State, CartesianDelta, JointVelocities7DOF, JointDelta
 from ui import UI
 
+from clients.groot import GrootConfig
+
 _PAGE_TEMPLATE = """<!doctype html>
 <html>
 <head>
@@ -118,6 +120,7 @@ _PAGE_TEMPLATE = """<!doctype html>
         <h1>cameras</h1>
         <div id="cameras"></div>
       </div>
+      
       <button id="awake-btn">Awake</button>
       <input type="text" id="prompt" placeholder="clear the table" style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35; background: #1a1d24; color: #fff; box-sizing: border-box;" />
       <label style="font-size: 13px; color: #c4c9d4;">gain
@@ -702,7 +705,7 @@ class GUI(UI):
         elif isinstance(action, PoseTarget):
             self._log_action_target_pose()
             rr.log("inference/action_target_pose/position", rr.Scalars([action.x, action.y, action.z]))
-            rr.log("/inference/action_target_pose/orientation", rr.Scalars([action.theta_x, action.theta_y, action.theta_z]))
+            rr.log("inference/action_target_pose/orientation", rr.Scalars([action.theta_x, action.theta_y, action.theta_z]))
             rr.log("inference/action_target_pose/gripper", rr.Scalars(gripper))
         elif isinstance(action, JointDelta):
             self._log_action_joint_deltas()
@@ -760,71 +763,90 @@ class GUI(UI):
     
 
     def _build_blueprint(self) -> rrb.Blueprint:
-        match self.client_setting:
-            case "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT":
-                # Define the blueprint for this setting
-                return rrb.Blueprint(
-                    rrb.Grid(
-                        rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
-                        rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
-                        rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                        rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Target Pose Position"),
-                        rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Target Pose Orientation"),
-                        rrb.TimeSeriesView(origin="inference/action_target_pose/gripper", name="Action -- Target Pose Gripper"),
-                        rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                        rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                        rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                    ),
-                    auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                )
-            case "OLD_NEW_EMBODIMENT":
-                # Define the blueprint for this setting
-                return rrb.Blueprint(
-                    rrb.Grid(
-                        rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
-                        rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
-                        rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                        rrb.TimeSeriesView(origin="inference/action_cartesian/position", name="Action -- Target Pose Position"),
-                        rrb.TimeSeriesView(origin="inference/action_cartesian/orientation", name="Action -- Target Pose Orientation"),
-                        rrb.TimeSeriesView(origin="inference/action_cartesian/gripper", name="Action -- Target Pose Gripper"),
-                        rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                        rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                        rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                    ),
-                    auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                )
-            case "NEW_EMBODIMENT":
-                # Define the blueprint for this setting
-                return rrb.Blueprint(
-                    rrb.Grid(
-                        rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
-                        rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                        rrb.TimeSeriesView(origin="inference/action_joint_angles/joint_angles", name="Action -- Joint Angles"),
-                        rrb.TimeSeriesView(origin="inference/action_joint_angles/gripper", name="Action --  Gripper"),
-                        rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                        rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                        rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                    ),
-                    auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                )
-            case _, None:
-                return rrb.Blueprint(
-                    rrb.Grid(
-                        
-                        rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
-                        rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
-                        rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
-                        rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                        rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Target Pose Position"),
-                        rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Target Pose Orientation"),
-                        rrb.TimeSeriesView(origin="inference/action_target_pose/gripper", name="Action -- Target Pose Gripper"),
-                        rrb.TimeSeriesView(origin="inference/action_joint", name="Action -- Joint"),
-                        rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                        rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                        rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                    ),
-                    auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                )
+        if isinstance(self.client_setting, GrootConfig):
+            match self.client_setting:
+                case GrootConfig.ABL6_EEFSRC_FULLSTATE:
+                    # Define the blueprint for this setting
+                    return rrb.Blueprint(
+                        rrb.Grid(
+                            rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Position"),
+                            rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Orientation"),
+                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_cartesian/position", name="Action -- Position Delta"),
+                            rrb.TimeSeriesView(origin="inference/action_cartesian/orientation", name="Action -- Orientation Delta"),
+                            rrb.TimeSeriesView(origin="inference/action_cartesian/gripper", name="Action -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                        ),
+                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                    )
+        else:
+            match self.client_setting:
+                case "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT":
+                    # Define the blueprint for this setting
+                    return rrb.Blueprint(
+                        rrb.Grid(
+                            rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
+                            rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
+                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Target Pose Position"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Target Pose Orientation"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/gripper", name="Action -- Target Pose Gripper"),
+                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                        ),
+                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                    )
+                case "OLD_NEW_EMBODIMENT":
+                    # Define the blueprint for this setting
+                    return rrb.Blueprint(
+                        rrb.Grid(
+                            rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
+                            rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
+                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_cartesian/position", name="Action -- Target Pose Position"),
+                            rrb.TimeSeriesView(origin="inference/action_cartesian/orientation", name="Action -- Target Pose Orientation"),
+                            rrb.TimeSeriesView(origin="inference/action_cartesian/gripper", name="Action -- Target Pose Gripper"),
+                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                        ),
+                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                    )
+                case "NEW_EMBODIMENT":
+                    # Define the blueprint for this setting
+                    return rrb.Blueprint(
+                        rrb.Grid(
+                            rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
+                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_joint_angles/joint_angles", name="Action -- Joint Angles"),
+                            rrb.TimeSeriesView(origin="inference/action_joint_angles/gripper", name="Action --  Gripper"),
+                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                        ),
+                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                    )
+                case _, None:
+                    return rrb.Blueprint(
+                        rrb.Grid(
+                            
+                            rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
+                            rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
+                            rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
+                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Target Pose Position"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Target Pose Orientation"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/gripper", name="Action -- Target Pose Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_joint", name="Action -- Joint"),
+                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                        ),
+                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                    )
 
     def _wait_for_serving_then_awake(self, timeout: float = 10.0) -> None:
         deadline = time.time() + timeout

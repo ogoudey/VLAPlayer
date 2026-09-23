@@ -23,7 +23,7 @@ class CartesianDelta(Action):
     d_theta_x: float = 0.0  # degrees, in tool's local space
     d_theta_y: float = 0.0  # degrees
     d_theta_z: float = 0.0  # degrees
-    gripper_command: Optional[float] = None
+    gripper_command: Optional[float] = None # a delta
 
 class JointDelta(Action):
     kind: Literal["joint_delta"] = "joint_delta"

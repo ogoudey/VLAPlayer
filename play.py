@@ -1,10 +1,14 @@
-#from clients.pi import Pi05Client, Pi05ServerConfiguration
-#client = Pi05Client(remote=Pi05ServerConfiguration(ip="192.168.0.177", port=8000, setting="LIBERO"))
 
 import sys
 
+# ------- GROOT_CONFIGS ------- #
+from clients.groot import GrootConfig
+
 from clients.groot import GrootN17Client, GrootN17ServerConfiguration
-client = GrootN17Client(remote=GrootN17ServerConfiguration(ip="192.168.0.156", port=5555, setting="NEW_EMBODIMENT", timeout_ms=15000))
+client = GrootN17Client(remote=GrootN17ServerConfiguration(ip="192.168.0.156", port=5555, config=GrootConfig.ABL6_EEFSRC_FULLSTATE, timeout_ms=15000))
+
+#from clients.pi import Pi05Client, Pi05ServerConfiguration
+#client = Pi05Client(remote=Pi05ServerConfiguration(ip="192.168.0.177", port=8000, setting="LIBERO"))
 
 
 from connections.kinova import KinovaConnection
