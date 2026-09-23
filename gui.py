@@ -79,7 +79,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from scipy.spatial.transform import Rotation
-from schemas import Action, JointAngles, PoseTarget, State, CartesianDelta, JointVelocities7DOF, JointDelta
+from schemas import Action, JointAngles, ObservationRelativeDelta, PoseTarget, State, CartesianDelta, JointVelocities7DOF, JointDelta
 from ui import UI
 
 from clients.groot import GrootConfig
@@ -635,6 +635,35 @@ class GUI(UI):
             static=True,
         )
 
+    def _log_action_obs_relative_delta(self) -> None:
+        if self._action_series_logged:
+            return
+        self._action_series_logged = True
+
+        names, colors = self._pose_series_style("target", translation=True)
+        rr.log(
+            "inference/obs_rel_delta/position",
+            rr.SeriesLines(names=names,
+                            colors=colors,
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+        names, colors = self._pose_series_style("target", translation=False)
+
+        rr.log(
+            "inference/obs_rel_delta/orientation",
+            rr.SeriesLines(names=names,
+                            colors=colors,
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+        rr.log(
+            "inference/obs_rel_delta/gripper",
+            rr.SeriesLines(names=["gripper_command"],
+                            interpolation_mode=rr.components.InterpolationMode.StepAfter),
+            static=True,
+        )
+
     def _log_action_target_pose(self) -> None:
             if self._action_series_logged:
                 return
@@ -695,13 +724,20 @@ class GUI(UI):
         if not self._display_active or not self._actively_predicting:
             return
 
-        gripper = action.gripper_command if action.gripper_command is not None else float("nan")
+        
 
         if isinstance(action, CartesianDelta):
+            gripper = action.gripper_command if action.gripper_command is not None else float("nan")
             self._log_action_cartesian_delta()
             rr.log("inference/action_cartesian/position", rr.Scalars([action.dx, action.dy, action.dz]))
             rr.log("inference/action_cartesian/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
             rr.log("inference/action_cartesian/gripper", rr.Scalars(gripper))
+        elif isinstance(action, ObservationRelativeDelta):
+            gripper = action.gripper_obs_rel_delta if action.gripper_obs_rel_delta is not None else float("nan")
+            self._log_action_obs_relative_delta()
+            rr.log("inference/obs_rel_delta/position", rr.Scalars([action.dx, action.dy, action.dz]))
+            rr.log("inference/obs_rel_delta/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
+            rr.log("inference/obs_rel_delta/gripper", rr.Scalars(gripper))
         elif isinstance(action, PoseTarget):
             self._log_action_target_pose()
             rr.log("inference/action_target_pose/position", rr.Scalars([action.x, action.y, action.z]))

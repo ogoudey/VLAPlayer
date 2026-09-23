@@ -25,6 +25,16 @@ class CartesianDelta(Action):
     d_theta_z: float = 0.0  # degrees
     gripper_command: Optional[float] = None # a delta
 
+class ObservationRelativeDelta(Action):
+    kind: Literal["cartesian_delta"] = "cartesian_delta"
+    dx: float = 0.0         # meters
+    dy: float = 0.0         # meters
+    dz: float = 0.0         # meters
+    d_theta_x: float = 0.0  # degrees, in tool's local space
+    d_theta_y: float = 0.0  # degrees
+    d_theta_z: float = 0.0  # degrees
+    gripper_obs_rel_delta: Optional[float] = None # a delta
+
 class JointDelta(Action):
     kind: Literal["joint_delta"] = "joint_delta"
     j0: float = 0.0 # radians / timestep

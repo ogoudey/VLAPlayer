@@ -24,7 +24,7 @@ from kortex_api.TCPTransport import TCPTransport
 from kortex_api.UDPTransport import UDPTransport
 
 from .connection import Connection
-from schemas import JointAngles, JointDelta, PoseTarget, State, Action, CartesianDelta, JointVelocities7DOF, Pose
+from schemas import JointAngles, JointDelta, ObservationRelativeDelta, PoseTarget, State, Action, CartesianDelta, JointVelocities7DOF, Pose
 from scipy.spatial.transform import Rotation
 
 
@@ -243,6 +243,8 @@ class KinovaConnection(Connection):
             self.handle_cartesian_delta(delta)      
         elif isinstance(action, CartesianDelta):
             self.handle_cartesian_delta(action)
+        elif isinstance(action, ObservationRelativeDelta):
+            self.handle_obs_relative_delta(action)
         elif isinstance(action, JointAngles):
             self.handle_joint_angles(action)
         elif isinstance(action, JointDelta):
@@ -348,6 +350,26 @@ class KinovaConnection(Connection):
 
             self.handle_gripper_command(action.gripper_command)
 
+    def handle_obs_relative_delta(self, action: ObservationRelativeDelta):
+        dt = self.control_period_s
+        gain = self.ui.gain if self.ui is not None else 1.0
+        print(f"Gain: {gain}, dt: {dt}, action: {action}")
+        twist_cmd = Base_pb2.TwistCommand()
+        twist_cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+        twist_cmd.twist.linear_x = self._clamp(gain * action.dx / dt, self.max_linear_velocity)
+        twist_cmd.twist.linear_y = self._clamp(gain * action.dy / dt, self.max_linear_velocity)
+        twist_cmd.twist.linear_z = self._clamp(gain * action.dz / dt, self.max_linear_velocity)
+        twist_cmd.twist.angular_x = self._clamp(gain * action.d_theta_x / dt, self.max_angular_velocity)
+        twist_cmd.twist.angular_y = self._clamp(gain * action.d_theta_y / dt, self.max_angular_velocity)
+        twist_cmd.twist.angular_z = self._clamp(gain * action.d_theta_z / dt, self.max_angular_velocity)
+        twist_cmd.duration = int(dt * 3.0)
+
+        self.base.SendTwistCommand(twist_cmd)
+
+        if action.gripper_obs_rel_delta is not None:
+
+            self.handle_gripper_delta(action.gripper_obs_rel_delta)
+
     def _clamp(self, value: float, limit: float) -> float:
         return max(-limit, min(limit, value))
 
@@ -369,7 +391,7 @@ class KinovaConnection(Connection):
 
         self._gripper_target = self._clamp(self._gripper_target + scale * gripper_delta, 1.0)
         self.handle_gripper_command(self._gripper_target)
-
+    
     def handle_gripper_command(self, value_0_1: float) -> None:
         """value_0_1: Kinova's own convention — 0.0 = fully open, 1.0 = fully closed."""
         cmd = Base_pb2.GripperCommand()

@@ -5,7 +5,7 @@ from typing import Optional
 from clients.client import Client
 from clients.client import ServerConfiguration
 from typing import override
-from schemas import Action, CartesianDelta, Observation, ActionChunk, Pose, PoseTarget, JointDelta, JointAngles
+from schemas import Action, CartesianDelta, Observation, ActionChunk, ObservationRelativeDelta, Pose, PoseTarget, JointDelta, JointAngles
 from packages.groot.server_client import PolicyClient
 from packages.groot.pose import EndEffectorPose
 from packages.groot.types import ActionFormat
@@ -46,7 +46,7 @@ class GrootN17ServerConfiguration(ServerConfiguration):
         self._ensure_client()
         request = self._to_gr00t_request(observation)  # still needs grounding — see below
         action, info = self._client.get_action(request)
-        return self._from_gr00t_response(action)
+        return self._from_gr00t_response(action, observation=observation)
 
     @override
     def test_health(self, timeout: float = 3.0) -> bool:
@@ -167,27 +167,6 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                         "sub_task": [[observation.language]],
                     },
                 }
-            case "NEW_EMBODIMENT": # something like HRILAB_DELTAS_TO_FROM_UT
-                pose = observation.state.target_pose
-                arm_quat = Rotation.from_euler(
-                    "xyz", [pose.theta_x, pose.theta_y, pose.theta_z], degrees=True
-                ).as_quat().astype(np.float32)
-
-                return {
-                    "video": {
-                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
-                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
-                    },
-                    "state": {
-                        "arm_joints": self._add_batch_and_time_dims(
-                            np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
-                        ),
-                        "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
-                    },
-                    "language": {
-                        "sub_task": [[observation.language]],
-                    },
-                }
             case GrootConfig.ABL7_FULLREL_QUAT:
                 pose = observation.state.target_pose
                 arm_quat = Rotation.from_euler(
@@ -201,8 +180,8 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                 print(f"[groot] {joints}")
                 return {
                     "video": {
-                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
                         "third_person": self._add_batch_dim(np.stack(exterior.images)),
+                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
                     },
                     "state": {
                         "arm_joints": self._add_batch_and_time_dims(
@@ -274,35 +253,103 @@ class GrootN17ServerConfiguration(ServerConfiguration):
         frame history buffer), so it only needs _add_batch_dim."""
         return array[np.newaxis, np.newaxis, ...]
 
-    def _from_gr00t_response(self, response: dict) -> ActionChunk:
+    def _from_gr00t_response(self, response: dict, observation: Optional[Observation] = None) -> ActionChunk:
         match self.config:
             case GrootConfig.ABL7_FULLREL_QUAT:
                 print(f"[groot] Response: {response}")
-                eef_delta = np.asarray(response["eef_delta"])[0]
+                
+                eef_obs_relative_delta = np.asarray(response["eef_delta"])[0]
                 gripper_delta = np.asarray(response["gripper_delta"])[0]
 
-                return ActionChunk(actions=[
-                    CartesianDelta(
-                        dx=eef_d[0], dy=eef_d[1], dz=eef_d[2],
-                        d_theta_x=eef_d[3], d_theta_y=eef_d[4], d_theta_z=eef_d[5],
-                        gripper_command=g[0],
+                ac = ActionChunk(actions=[])
+
+                observation_pose = observation.state.target_pose
+                observation_gripper = observation.state.gripper
+                projected_pose = observation.state.target_pose
+                projected_gripper = observation.state.gripper
+                for eef_d, g in zip(eef_obs_relative_delta, gripper_delta):
+                    next_pose = PoseTarget(
+                        x=observation_pose.x + eef_d[0],
+                        y=observation_pose.y + eef_d[1],
+                        z=observation_pose.z + eef_d[2],
+                        theta_x=observation_pose.theta_x + eef_d[3],
+                        theta_y=observation_pose.theta_y + eef_d[4],
+                        theta_z=observation_pose.theta_z + eef_d[5],
+                        gripper_command=observation_gripper + g[0]
                     )
-                    for eef_d, g in zip(eef_delta, gripper_delta)
-                ])
+                    
+                    ac.actions.append(
+                        ObservationRelativeDelta(
+                            dx=next_pose.x - projected_pose.x,
+                            dy=next_pose.y - projected_pose.y,
+                            dz=next_pose.z - projected_pose.z,
+                            d_theta_x=next_pose.theta_x - projected_pose.theta_x,
+                            d_theta_y=next_pose.theta_y - projected_pose.theta_y,
+                            d_theta_z=next_pose.theta_z - projected_pose.theta_z,
+                            gripper_obs_rel_delta=g[0],
+                        )
+                    )
+
+                    projected_pose.x += eef_d[0]
+                    projected_pose.y += eef_d[1]
+                    projected_pose.z += eef_d[2]
+                    projected_pose.theta_x += eef_d[3]
+                    projected_pose.theta_y += eef_d[4]
+                    projected_pose.theta_z += eef_d[5]
+                    projected_gripper += g[0]
+                    
+                
+                return ac
+            
             case GrootConfig.ABL7_FULLREL_ROT6D:
                 d9 = response['eef_pose']
-                pos_delta = np.asarray(d9[:, :3])[0]
+                eef_obs_relative_pos_delta = np.asarray(d9[:, :3])[0]
                 rotv6d_delta = np.asarray(d9[:, 3:9])[0]
-                gripper_delta = np.asarray(response["gripper"])[0]
+                eef_obs_relative_rot_delta = self._rot6d_to_euler(rotv6d_delta)
 
-                return ActionChunk(actions=[
-                    CartesianDelta(
-                        dx=pos_d[0], dy=pos_d[1], dz=pos_d[2],
-                        d_theta_x=rotv6d_d[0], d_theta_y=rotv6d_d[1], d_theta_z=rotv6d_d[2],
-                        gripper_command=g[0],
+                print(f"[groot] Response: {response}")
+                                
+                gripper_delta = np.asarray(response["gripper_delta"])[0]
+
+                ac = ActionChunk(actions=[])
+
+                observation_pose = observation.state.target_pose
+                observation_gripper = observation.state.gripper
+                projected_pose = observation.state.target_pose
+                projected_gripper = observation.state.gripper
+                for eef_pos_d, eef_rot_d, g in zip(eef_obs_relative_pos_delta, eef_obs_relative_rot_delta, gripper_delta):
+                    next_pose = PoseTarget(
+                        x=observation_pose.x + eef_pos_d[0],
+                        y=observation_pose.y + eef_pos_d[1],
+                        z=observation_pose.z + eef_pos_d[2],
+                        theta_x=observation_pose.theta_x + eef_rot_d[3],
+                        theta_y=observation_pose.theta_y + eef_rot_d[4],
+                        theta_z=observation_pose.theta_z + eef_rot_d[5],
+                        gripper_command=observation_gripper + g[0]
                     )
-                    for pos_d, rotv6d_d, g in zip(pos_delta, rotv6d_delta, gripper_delta)
-                ])
+                    
+                    ac.actions.append(
+                        ObservationRelativeDelta(
+                            dx=next_pose.x - projected_pose.x,
+                            dy=next_pose.y - projected_pose.y,
+                            dz=next_pose.z - projected_pose.z,
+                            d_theta_x=next_pose.theta_x - projected_pose.theta_x,
+                            d_theta_y=next_pose.theta_y - projected_pose.theta_y,
+                            d_theta_z=next_pose.theta_z - projected_pose.theta_z,
+                            gripper_obs_rel_delta=g[0],
+                        )
+                    )
+
+                    projected_pose.x += eef_pos_d[0]
+                    projected_pose.y += eef_pos_d[1]
+                    projected_pose.z += eef_pos_d[2]
+                    projected_pose.theta_x += eef_rot_d[3]
+                    projected_pose.theta_y += eef_rot_d[4]
+                    projected_pose.theta_z += eef_rot_d[5]
+                    projected_gripper += g[0]
+                    
+                
+                return ac
             case GrootConfig.ABL6_EEFSRC_FULLSTATE:
                 pos_delta = np.asarray(response["pos_delta"])[0]
                 rot_delta = np.asarray(response["rot_delta"])[0]
