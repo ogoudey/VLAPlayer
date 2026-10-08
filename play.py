@@ -5,7 +5,18 @@ import sys
 from clients.groot import GrootConfig
 
 from clients.groot import GrootN17Client, GrootN17ServerConfiguration
-client = GrootN17Client(remote=GrootN17ServerConfiguration(ip="192.168.0.156", port=5555, config=GrootConfig.ABL6_EEFSRC_FULLSTATE, timeout_ms=15000))
+client = GrootN17Client(remote=GrootN17ServerConfiguration(ip="192.168.0.196", port=5555, config=GrootConfig.THREE_TASKS_2_FIXED_LORA, timeout_ms=15000))
+
+"""
+IF the state pose does not follow the target pose, expose the twists.
+"""
+
+"""
+Server:
+uv run python gr00t/eval/run_gr00t_server.py --model-path /home/hrilab/Isaac-GR00T/Models/gr00t_tabletop_3tasks_rot6d_LoRA  --embodiment-tag NEW_EMBODIMENT --device cuda:0
+"""
+
+
 
 #from clients.pi import Pi05Client, Pi05ServerConfiguration
 #client = Pi05Client(remote=Pi05ServerConfiguration(ip="192.168.0.177", port=8000, setting="LIBERO"))

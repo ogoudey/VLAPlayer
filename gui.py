@@ -422,16 +422,19 @@ class GUI(UI):
             self._log_robot_series_styles(num_joints=len(state.joint_angles))
 
             
-            rr.log("state/target_pose/position", rr.Scalars([pose.x, pose.y, pose.z]))
-            rr.log("state/target_pose/orientation", rr.Scalars([pose.theta_x, pose.theta_y, pose.theta_z]))
+            rr.log("state/pose/position", rr.Scalars([pose.x, pose.y, pose.z]))
+            rr.log("state/pose/orientation", rr.Scalars([pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z]))
             rr.log("state/gripper", rr.Scalars(state.gripper))
             rr.log("state/joint_angles", rr.Scalars(list(state.joint_angles)))
 
-            quat_xyzw = Rotation.from_euler(
-                "xyz", [pose.theta_x, pose.theta_y, pose.theta_z], degrees=True
-            ).as_quat()
+            quat_xyzw = Rotation.from_quat([
+                pose.theta_w,
+                pose.theta_x,
+                pose.theta_y,
+                pose.theta_z,
+            ]).as_quat()
             rr.log(
-                "state/target_pose",  # unchanged — the Transform3D still lives on the parent path, not either child
+                "state/target_pos",  # unchanged — the Transform3D still lives on the parent path, not either child
                 rr.Transform3D(
                     translation=[pose.x, pose.y, pose.z],
                     quaternion=rr.Quaternion(xyzw=quat_xyzw),
@@ -729,9 +732,9 @@ class GUI(UI):
         if isinstance(action, CartesianDelta):
             gripper = action.gripper_command if action.gripper_command is not None else float("nan")
             self._log_action_cartesian_delta()
-            rr.log("inference/action_cartesian/position", rr.Scalars([action.dx, action.dy, action.dz]))
-            rr.log("inference/action_cartesian/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
-            rr.log("inference/action_cartesian/gripper", rr.Scalars(gripper))
+            rr.log("inference/action_delta/position", rr.Scalars([action.dx, action.dy, action.dz]))
+            rr.log("inference/action_delta/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
+            rr.log("inference/gripper", rr.Scalars(gripper))
         elif isinstance(action, ObservationRelativeDelta):
             gripper = action.gripper_obs_rel_delta if action.gripper_obs_rel_delta is not None else float("nan")
             self._log_action_obs_relative_delta()
@@ -741,8 +744,8 @@ class GUI(UI):
         elif isinstance(action, PoseTarget):
             self._log_action_target_pose()
             rr.log("inference/action_target_pose/position", rr.Scalars([action.x, action.y, action.z]))
-            rr.log("inference/action_target_pose/orientation", rr.Scalars([action.theta_x, action.theta_y, action.theta_z]))
-            rr.log("inference/action_target_pose/gripper", rr.Scalars(gripper))
+            rr.log("inference/action_target_pose/orientation", rr.Scalars([action.theta_w, action.theta_x, action.theta_y, action.theta_z]))
+            rr.log("inference/gripper", rr.Scalars(action.gripper_command))
         elif isinstance(action, JointDelta):
             self._log_action_joint_deltas()
             rr.log("inference/action_joint_deltas/position", rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6]))
@@ -801,16 +804,76 @@ class GUI(UI):
     def _build_blueprint(self) -> rrb.Blueprint:
         if isinstance(self.client_setting, GrootConfig):
             match self.client_setting:
+                case GrootConfig.THREE_TASKS_2_ABS_DELTAS_LORA | GrootConfig.THREE_TASKS_2_FIXED_LORA:
+                    return rrb.Blueprint(
+                        rrb.Grid(
+                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
+                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
+                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_delta/position", name="Action -- Position"),
+                            rrb.TimeSeriesView(origin="inference/action_delta/orientation", name="Action -- Orientation"),
+                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                        ),
+                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                    )
+                case GrootConfig.THREE_TASKS_ABS_DELTAS_LORA:
+                    return rrb.Blueprint(
+                        rrb.Grid(
+                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
+                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
+                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_delta/position", name="Action -- Position"),
+                            rrb.TimeSeriesView(origin="inference/action_delta/orientation", name="Action -- Orientation"),
+                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                        ),
+                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                    )
+                case GrootConfig.THREE_TASKS_REL_ROT6D_LORA:
+                    return rrb.Blueprint(
+                        rrb.Grid(
+                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
+                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
+                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Position"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Orientation"),
+                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                        ),
+                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                    )
                 case GrootConfig.ABL6_EEFSRC_FULLSTATE:
                     # Define the blueprint for this setting
                     return rrb.Blueprint(
                         rrb.Grid(
-                            rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Position"),
-                            rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Orientation"),
+                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
+                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
                             rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_cartesian/position", name="Action -- Position Delta"),
-                            rrb.TimeSeriesView(origin="inference/action_cartesian/orientation", name="Action -- Orientation Delta"),
-                            rrb.TimeSeriesView(origin="inference/action_cartesian/gripper", name="Action -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Position Delta"),
+                            rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Orientation Delta"),
+                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
+                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
+                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
+                        ),
+                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
+                    )
+                case GrootConfig.ABS_ROT6D_LORA:
+                    return rrb.Blueprint(
+                        rrb.Grid(
+                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
+                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
+                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
+                            rrb.TimeSeriesView(origin="inference/target_pose/position", name="Action -- Position"),
+                            rrb.TimeSeriesView(origin="inference/target_pose/orientation", name="Action -- Orientation"),
+                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
                             rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
                             rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
                             rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),

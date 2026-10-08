@@ -22,6 +22,11 @@ class GrootConfig(Enum):
     ABL7_FULLREL_QUAT = "ABL7_FULLREL_QUAT"
     ABL7_FULLREL_ROT6D = "FULLREL_ROT6D"
     ABL6_EEFSRC_FULLSTATE = "ABL6_EEFSRC_FULLSTATE"
+    ABS_ROT6D_LORA = "ABS_ROT6D_LORA"
+    THREE_TASKS_REL_ROT6D_LORA = "THREE_TASKS_REL_ROT6D_LORA"
+    THREE_TASKS_ABS_DELTAS_LORA = "THREE_TASKS_ABS_DELTAS_LORA"
+    THREE_TASKS_2_ABS_DELTAS_LORA = "THREE_TASKS_2_ABS_DELTAS_LORA"
+    THREE_TASKS_2_FIXED_LORA = "THREE_TASKS_2_FIXED_LORA"
 
 @dataclass
 class GrootN17ServerConfiguration(ServerConfiguration):
@@ -100,94 +105,40 @@ class GrootN17ServerConfiguration(ServerConfiguration):
         if wrist is None or exterior is None:
             raise RuntimeError(f"Expected 'onboard' plus one other camera, got: {list(views)}")
         match self.config:
-            case "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT":
-                return {
-                    "video": {
-                        "exterior_image_1_left": self._add_batch_dim(np.stack(exterior.images)),  # (1, T, H, W, C)
-                        "wrist_image_left": self._add_batch_dim(np.stack(wrist.images)),
-                    },
-                    "state": {
-                        "eef_9d": self._add_batch_and_time_dims(
-                            self._eef_9d(observation.state.target_pose)
-                        ),
-                        "gripper_position": self._add_batch_and_time_dims(
-                            np.array([observation.state.gripper], dtype=np.float32)
-                        ),
-                        "joint_position": self._add_batch_and_time_dims(
-                            np.array(observation.state.joint_angles, dtype=np.float32)
-                        ),
-                    },
-                    "language": {
-                        "annotation.language.language_instruction": [[observation.language]],  # (B=1, T=1) as plain nested lists — not an ndarray
-                    },
-                }
-            case "OLD_NEW_EMBODIMENT": # something like HRILAB_DELTAS_TO_FROM_UT
+            case GrootConfig.THREE_TASKS_2_ABS_DELTAS_LORA:
                 pose = observation.state.target_pose
-                arm_quat = Rotation.from_euler(
-                    "xyz", [pose.theta_x, pose.theta_y, pose.theta_z], degrees=True
-                ).as_quat().astype(np.float32)
 
+                
                 return {
                     "video": {
-                        "wrist_image": self._add_batch_dim(np.stack(wrist.images)),
-                        "third_person_image": self._add_batch_dim(np.stack(exterior.images)),
-                    },
-                    "state": {
-                        "arm_joint_angles": self._add_batch_and_time_dims(
-                            np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
-                        ),
-                        "arm_pos": self._add_batch_and_time_dims(np.array([pose.x, pose.y, pose.z], dtype=np.float32)),
-                        "arm_quat": self._add_batch_and_time_dims(arm_quat),
-                        "gripper_pos": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
-                    },
-                    "language": {
-                        "annotation.human.task_description": [[observation.language]],
-                    },
-                }
-            case GrootConfig.ABL6_EEFSRC_FULLSTATE:
-                pose = observation.state.target_pose
-                arm_quat = Rotation.from_euler(
-                    "xyz", [pose.theta_x, pose.theta_y, pose.theta_z], degrees=True
-                ).as_quat().astype(np.float32)
-
-                return {
-                    "video": {
-                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
                         "third_person": self._add_batch_dim(np.stack(exterior.images)),
+                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
                     },
                     "state": {
                         "arm_joints": self._add_batch_and_time_dims(
                             np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
                         ),
                         "arm_pos": self._add_batch_and_time_dims(np.array([pose.x, pose.y, pose.z], dtype=np.float32)),
-                        "arm_quat": self._add_batch_and_time_dims(arm_quat),
+                        "arm_quat": self._add_batch_and_time_dims(np.array([pose.theta_x, pose.theta_y, pose.theta_z, pose.theta_w], dtype=np.float32)),
                         "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
                     },
                     "language": {
                         "sub_task": [[observation.language]],
                     },
                 }
-            case GrootConfig.ABL7_FULLREL_QUAT:
+            case GrootConfig.ABL6_EEFSRC_FULLSTATE:
                 pose = observation.state.target_pose
-                arm_quat = Rotation.from_euler(
-                    "xyz", [pose.theta_x, pose.theta_y, pose.theta_z], degrees=True
-                ).as_quat().astype(np.float32)
-
-                joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
-                joints_sine_encoded = np.sin(joints)
-                joints_cosine_encoded = np.cos(joints)
-                joints_sine_cosine_encoded = np.concatenate([joints_sine_encoded, joints_cosine_encoded], axis=-1)
-                print(f"[groot] {joints}")
                 return {
                     "video": {
-                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
                         "wrist": self._add_batch_dim(np.stack(wrist.images)),
+                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
                     },
                     "state": {
                         "arm_joints": self._add_batch_and_time_dims(
-                            joints
+                            np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
                         ),
-                        "eef_pose": self._add_batch_and_time_dims(np.concatenate([np.array([pose.x, pose.y, pose.z], dtype=np.float32), arm_quat], axis=-1)),
+                        "arm_pos": self._add_batch_and_time_dims(np.array([pose.x, pose.y, pose.z], dtype=np.float32)),
+                        "arm_quat": self._add_batch_and_time_dims(np.array([pose.theta_x, pose.theta_y, pose.theta_z, pose.theta_w], dtype=np.float32)),
                         "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
                     },
                     "language": {
@@ -221,17 +172,158 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                         "sub_task": [[observation.language]],
                     },
                 }
+            case GrootConfig.ABS_ROT6D_LORA:
+                pose = observation.state.target_pose
 
-    def _eef_6d_rot(self, pose: Pose) -> np.ndarray:
-        ee_pose = EndEffectorPose(
-            translation=[pose.x, pose.y, pose.z],
-            rotation=[pose.theta_x, pose.theta_y, pose.theta_z],
-            rotation_type="euler",
-            rotation_order="xyz",   # confirms what we assumed for TwistCommand's frame too — scipy's lowercase "xyz" is extrinsic/fixed-axis, matching Kinova's own convention
-            degrees=True,
-        )
-        return ee_pose.rot6d.astype(np.float32)
+                joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
+                #joints_sine_encoded = np.sin(joints)
+                #joints_cosine_encoded = np.cos(joints)
+                #joints_sine_cosine_encoded = np.concatenate([joints_sine_encoded, joints_cosine_encoded], axis=-1)
+                print(f"[groot] {joints}")
+                return {
+                    "video": {
+                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
+                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
+                    },
+                    "state": {
+                        "arm_joints": self._add_batch_and_time_dims(
+                            joints
+                        ),
+                        "eef_pose": self._add_batch_and_time_dims(np.array([pose.x, pose.y, pose.z, pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z], dtype=np.float32)),
+                        "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
+                    },
+                    "language": {
+                        "sub_task": [[observation.language]],
+                    },
+                }
+            case GrootConfig.THREE_TASKS_REL_ROT6D_LORA:
+                joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
 
+                pose = observation.state.target_pose
+                rot6d = self._eef_6d_rot(pose)
+                position = np.array([pose.x, pose.y, pose.z], dtype=np.float32)
+                pose_9d = np.concatenate([position, rot6d])
+                return_ = {
+                    "video": {
+                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
+                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
+                    },
+                    "state": {
+                        "arm_joints": self._add_batch_and_time_dims(
+                            joints
+                        ),
+                        "eef_pose": self._add_batch_and_time_dims(pose_9d),
+                        "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
+                    },
+                    "language": {
+                        "sub_task": [[observation.language]],
+                    },
+                }
+                return return_
+            case GrootConfig.ABS_ROT6D_LORA:
+                pose = observation.state.target_pose
+
+                joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
+                #joints_sine_encoded = np.sin(joints)
+                #joints_cosine_encoded = np.cos(joints)
+                #joints_sine_cosine_encoded = np.concatenate([joints_sine_encoded, joints_cosine_encoded], axis=-1)
+                print(f"[groot] {joints}")
+                return {
+                    "video": {
+                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
+                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
+                    },
+                    "state": {
+                        "arm_joints": self._add_batch_and_time_dims(
+                            joints
+                        ),
+                        "eef_pose": self._add_batch_and_time_dims(np.array([pose.x, pose.y, pose.z, pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z], dtype=np.float32)),
+                        "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
+                    },
+                    "language": {
+                        "sub_task": [[observation.language]],
+                    },
+                }
+            case GrootConfig.THREE_TASKS_ABS_DELTAS_LORA:
+                pose = observation.state.target_pose
+
+                joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
+                JOINT_WINDOW_LO = np.array([-2.559710208569662, -2.8912901023971003, -6.894980764381135, -5.040146803847993, -3.489536766205923, -3.6565758551107805, -1.1027804930978498], dtype=np.float32)
+                joints = (joints - JOINT_WINDOW_LO) % (2 * np.pi) + JOINT_WINDOW_LO
+                rot6d = self._eef_6d_rot_first_two_rows(pose)
+                position = np.array([pose.x, pose.y, pose.z], dtype=np.float32)
+                pose_9d = np.concatenate([position, rot6d])
+                return {
+                    "video": {
+                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
+                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
+                    },
+                    "state": {
+                        "arm_joints": self._add_batch_and_time_dims(
+                            joints
+                        ),
+                        "eef_pose": self._add_batch_and_time_dims(pose_9d),
+                        "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
+                    },
+                    "language": {
+                        "sub_task": [[observation.language]],
+                    },
+                }
+            case GrootConfig.THREE_TASKS_2_FIXED_LORA:
+                pose = observation.state.target_pose
+
+                joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
+                JOINT_WINDOW_LO = np.array([
+                    -3.023638133202688,
+                    -2.8912901023971003,
+                    -6.3224516868512275,
+                    -5.040146803847993,
+                    -3.2025910357581537,
+                    -3.610507700835363,
+                    -1.4728048165612897
+                ], dtype=np.float32)
+                joints = (joints - JOINT_WINDOW_LO) % (2 * np.pi) + JOINT_WINDOW_LO
+
+
+                q_ref = np.array([
+                    0.7057592503866893,
+                    0.7076099545579241,
+                    0.024808814852628452,
+                    0.024011568248638298
+                ], dtype=np.float32)
+                quat = np.array([pose.theta_x, pose.theta_y, pose.theta_z, pose.theta_w])
+                adjusted_quat = -quat if quat.dot(q_ref) < 0 else quat
+                print(f"[torequest] {observation.language}")
+                return {
+                    "video": {
+                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
+                        "wrist": self._add_batch_dim(np.stack(wrist.images))
+                    },
+                    "state": {
+                        "arm_joints": self._add_batch_and_time_dims(
+                            joints
+                        ),
+                        "arm_pos": self._add_batch_and_time_dims(np.array([pose.x, pose.y, pose.z], dtype=np.float32)),
+                        "arm_quat": self._add_batch_and_time_dims(np.array(adjusted_quat, dtype=np.float32)),
+                        "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
+                    },
+                    "language": {
+                        "sub_task": [[observation.language]],
+                    },
+                }
+
+    def _eef_6d_rot_first_two_columns(self, pose: Pose) -> np.ndarray:
+        rot = Rotation.from_quat([pose.theta_x, pose.theta_y, pose.theta_z, pose.theta_w])
+        R = rot.as_matrix()
+        # First two columns, laid out [col0, col1] to mirror rot6d_to_quaternion
+        return R[:2, :].reshape(6).astype(np.float32)
+    
+    def _eef_6d_rot_first_two_rows(self, pose: Pose) -> np.ndarray:
+        rot = Rotation.from_quat([pose.theta_x, pose.theta_y, pose.theta_z, pose.theta_w])
+        R = rot.as_matrix()
+        # First two rows, laid out [row0, row1] to mirror rot6d_to_quaternion
+        return np.concatenate([R[0, :], R[1, :]]).astype(np.float32)
+    
     def _eef_9d(self, pose: Pose) -> np.ndarray:
         ee_pose = EndEffectorPose(
             translation=[pose.x, pose.y, pose.z],
@@ -255,6 +347,52 @@ class GrootN17ServerConfiguration(ServerConfiguration):
 
     def _from_gr00t_response(self, response: dict, observation: Optional[Observation] = None) -> ActionChunk:
         match self.config:
+            case GrootConfig.THREE_TASKS_2_ABS_DELTAS_LORA | GrootConfig.THREE_TASKS_2_FIXED_LORA:
+                delta_pos = np.asarray(response["pos_delta"])[0]
+                #delta_rot = np.asarray(response["rot_delta"])[0]
+                delta_rot = np.degrees(np.asarray(response["rot_delta"])[0])
+                gripper = np.asarray(response["gripper"])[0]
+                return ActionChunk(actions=[
+                    CartesianDelta(
+                        dx=float(pos[0]), dy=float(pos[1]), dz=float(pos[2]),
+                        d_theta_x=float(rot[0]), d_theta_y=float(rot[1]), d_theta_z=float(rot[2]),
+                        gripper_command=float(gripper[0]),
+                    )
+                    for pos, rot, gripper in zip(delta_pos, delta_rot, gripper)
+                ])
+            case GrootConfig.THREE_TASKS_ABS_DELTAS_LORA:
+                deltas = np.asarray(response["eef_pose_deltas"])[0]  # (T, 6)
+                gripper = np.asarray(response["gripper_targets"])[0]         # (T, 1)
+                return ActionChunk(actions=[
+                    CartesianDelta(
+                        dx=float(d[0]), dy=float(d[1]), dz=float(d[2]),
+                        d_theta_x=float(d[3]), d_theta_y=float(d[4]), d_theta_z=float(d[5]),
+                        gripper_command=float(g[0]),
+                    )
+                    for d, g in zip(deltas, gripper)
+                ])
+            case GrootConfig.THREE_TASKS_REL_ROT6D_LORA:
+                print(f"[groot] Response: {response}")
+                d9 = response['eef_pose_targets'][0]  # shape (T, 9)
+                gripper = response["gripper_targets"][0]  # shape (T,)
+
+                ac = ActionChunk(actions=[])
+                for step, g in zip(d9, gripper):
+                    pos = step[:3]      # (3,)
+                    rot6d = step[3:9]   # (6,)
+                    
+                    eef_abs_quat = self.rot6d_to_quaternion(rot6d)
+                    ac.actions.append(PoseTarget(
+                        x=pos[0],
+                        y=pos[1],
+                        z=pos[2],
+                        theta_w=eef_abs_quat[0],
+                        theta_x=eef_abs_quat[1],
+                        theta_y=eef_abs_quat[2],
+                        theta_z=eef_abs_quat[3],
+                        gripper_command=g[0]
+                    ))
+                return ac
             case GrootConfig.ABL7_FULLREL_QUAT:
                 print(f"[groot] Response: {response}")
                 
@@ -362,20 +500,47 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                     )
                     for pos, rot, g in zip(pos_delta, rot_delta, gripper)
                 ])
-            case "NEW_EMBODIMENT": # something like HRILAB_DELTAS_TO_FROM_UT
-                try:
-                    joint_angles = np.asarray(response["joint_target"])[0]
-                    gripper = np.asarray(response["gripper"])[0]
-                except KeyError as e:
-                    print(f"[groot] KeyError: {e} in response: {response}")
-                return ActionChunk(actions=[
-                    CartesianDelta(
-                        
-                    )
-                    for angles, g in zip(joint_angles, gripper)
-                ])
+            case GrootConfig.ABS_ROT6D_LORA:
+                d9 = response['eef_pose_ik_targets']
+                eef_abs_pos = np.asarray(d9[:, :3])[0]
+                eef_abs_rotv6d = np.asarray(d9[:, 3:9])[0]
+                
+                gripper = np.asarray(response["gripper_targets"])[0]
+
+                ac = ActionChunk(actions=[])
+
+                for pos, rot6d, g in zip(eef_abs_pos, eef_abs_rotv6d, gripper):
+
+                    eef_abs_quat = self.rot6d_to_quaternion(rot6d)
+                    ac.append(PoseTarget(
+                        x=float(pos[0]),
+                        y=float(pos[1]),
+                        z=float(pos[2]),
+                        theta_x=float(eef_abs_quat[1]),
+                        theta_y=float(eef_abs_quat[2]),
+                        theta_z=float(eef_abs_quat[3]),
+                        theta_w=float(eef_abs_quat[0]),
+                        gripper=g
+                    ))
             case _:
                 raise ValueError(f"Setting not implemented for {self.config}")
+
+    def rot6d_to_quaternion(self, rot6d: np.ndarray) -> np.ndarray:
+        x_raw, y_raw = rot6d[:3], rot6d[3:]
+
+        # Gram-Schmidt
+        x = x_raw / np.linalg.norm(x_raw)
+        z = np.cross(x, y_raw)
+        z = z / np.linalg.norm(z)
+        y = np.cross(z, x)
+
+        rot_matrix = np.column_stack((x, y, z))
+
+        # Convert matrix to quaternion [x, y, z, w] using SciPy, then reorder to [w, x, y, z]
+        quat_xyzw = Rotation.from_matrix(rot_matrix).as_quat()
+        return np.array(
+            [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
+        )  # [w, x, y, z]
 
     def _rot6d_to_euler(self, d6):
         rot_matrix = self._rot6d_to_matrix(d6)
@@ -428,8 +593,10 @@ class GrootN17Client(Client):
                 next_tick = time_package.monotonic()
                 continue
 
-            if action_queue.empty():
+            #if action_queue.empty():
+            if action_queue.qsize() < 1:
                 self.connection.pause()  # pause the arm while we wait for a prediction
+                time_package.sleep(0.1)
                 self.ui.report_loop_event("Action queue empty — requesting prediction")
                 try:
                     predict_start = time_package.monotonic()
@@ -443,6 +610,7 @@ class GrootN17Client(Client):
                     self.ui.report_loop_event("Prediction returned empty chunk", level="warn")
                     time_package.sleep(0.5)
                     continue
+                action_queue.queue.clear()  # clear any stale actions from the queue
                 for action in chunk.actions[:GrootN17ServerConfiguration.EXECUTION_HORIZON]:
                     action_queue.put(action)
                 self.ui.report_loop_event(f"Received chunk of {len(chunk.actions)} actions")
@@ -457,12 +625,14 @@ class GrootN17Client(Client):
                 self.connection.apply_action(action)
             except Exception as e:
                 self.ui.report_loop_event(f"apply_action failed, skipping: {e}", level="warn")
-
+            
             tick_start = time_package.monotonic()
             next_tick += period
             sleep_for = next_tick - time_package.monotonic()
+            
             if sleep_for > 0:
                 time_package.sleep(sleep_for)
+                
             else:
                 next_tick = time_package.monotonic()
             self.ui.report_loop_timing(period, time_package.monotonic() - tick_start + max(sleep_for, 0))

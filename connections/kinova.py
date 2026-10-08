@@ -208,13 +208,19 @@ class KinovaConnection(Connection):
     def _get_current_pose(self):
         with self._feedback_lock:
             feedback = self._latest_feedback
+
+        quat = Rotation.from_euler(
+            "xyz", [feedback.base.tool_pose_theta_x, feedback.base.tool_pose_theta_y, feedback.base.tool_pose_theta_z], degrees=True
+        ).as_quat().astype(np.float32)
+        
         target_pose = Pose(
             x=feedback.base.tool_pose_x,
             y=feedback.base.tool_pose_y,
             z=feedback.base.tool_pose_z,
-            theta_x=feedback.base.tool_pose_theta_x,
-            theta_y=feedback.base.tool_pose_theta_y,
-            theta_z=feedback.base.tool_pose_theta_z,
+            theta_w=quat[3],
+            theta_x=quat[0],
+            theta_y=quat[1],
+            theta_z=quat[2],
         )
         return target_pose
     
@@ -222,15 +228,23 @@ class KinovaConnection(Connection):
         if isinstance(action, PoseTarget):
             current_pose = self._get_current_pose()
 
-            current_rotation = Rotation.from_euler(
-                "xyz", [current_pose.theta_x, current_pose.theta_y, current_pose.theta_z], degrees=True
-            )
-            target_rotation = Rotation.from_euler(
-                "xyz", [action.theta_x, action.theta_y, action.theta_z], degrees=True
-            )
-            delta_rotation = target_rotation * current_rotation.inv()
-            d_theta_x, d_theta_y, d_theta_z = delta_rotation.as_euler("xyz", degrees=True)
+            current_rotation = Rotation.from_quat([
+                current_pose.theta_x,
+                current_pose.theta_y,
+                current_pose.theta_z,
+                current_pose.theta_w
+            ])
 
+            target_rotation = Rotation.from_quat([
+                action.theta_x,
+                action.theta_y,
+                action.theta_z,
+                action.theta_w,
+            ])
+
+            delta_rotation = target_rotation * current_rotation.inv()
+            #d_theta_x, d_theta_y, d_theta_z = delta_rotation.as_euler("xyz", degrees=True)
+            d_theta_x, d_theta_y, d_theta_z = delta_rotation.as_rotvec(degrees=True)
             delta = CartesianDelta(
                 dx=action.x - current_pose.x,
                 dy=action.y - current_pose.y,
@@ -334,14 +348,23 @@ class KinovaConnection(Connection):
         dt = self.control_period_s
         gain = self.ui.gain if self.ui is not None else 1.0
         print(f"Gain: {gain}, dt: {dt}, action: {action}")
+
+        omega = gain * np.array([action.d_theta_x, action.d_theta_y, action.d_theta_z]) / dt
+        #omega_norm = np.linalg.norm(omega)
+        #if omega_norm > self.max_angular_velocity:
+        #    omega *= self.max_angular_velocity / omega_norm
+
         twist_cmd = Base_pb2.TwistCommand()
         twist_cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
         twist_cmd.twist.linear_x = self._clamp(gain * action.dx / dt, self.max_linear_velocity)
         twist_cmd.twist.linear_y = self._clamp(gain * action.dy / dt, self.max_linear_velocity)
         twist_cmd.twist.linear_z = self._clamp(gain * action.dz / dt, self.max_linear_velocity)
-        twist_cmd.twist.angular_x = self._clamp(gain * action.d_theta_x / dt, self.max_angular_velocity)
-        twist_cmd.twist.angular_y = self._clamp(gain * action.d_theta_y / dt, self.max_angular_velocity)
-        twist_cmd.twist.angular_z = self._clamp(gain * action.d_theta_z / dt, self.max_angular_velocity)
+        #twist_cmd.twist.angular_x = self._clamp(gain * action.d_theta_x / dt, self.max_angular_velocity)
+        #twist_cmd.twist.angular_y = self._clamp(gain * action.d_theta_y / dt, self.max_angular_velocity)
+        #twist_cmd.twist.angular_z = self._clamp(gain * action.d_theta_z / dt, self.max_angular_velocity)
+        twist_cmd.twist.angular_x = float(omega[0])
+        twist_cmd.twist.angular_y = float(omega[1])
+        twist_cmd.twist.angular_z = float(omega[2])
         twist_cmd.duration = int(dt * 3.0)
 
         self.base.SendTwistCommand(twist_cmd)

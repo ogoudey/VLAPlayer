@@ -72,9 +72,10 @@ class PoseTarget(Action):
     x: float          # meters
     y: float          # meters
     z: float           # meters
-    theta_x: float     # degrees, Tait-Bryan
-    theta_y: float     # degrees
-    theta_z: float     # degrees
+    theta_w: float     # radians
+    theta_x: float     # radians
+    theta_y: float     # radians
+    theta_z: float     # radians
     gripper_command: Optional[float] = None
 
 class Vision(BaseModel):
@@ -106,9 +107,10 @@ class Pose(BaseModel):
     x: float          # meters
     y: float          # meters
     z: float           # meters
-    theta_x: float     # degrees, Tait-Bryan
-    theta_y: float     # degrees
-    theta_z: float     # degrees
+    theta_w: float     # radians
+    theta_x: float     # radians
+    theta_y: float     # radians
+    theta_z: float     # radians
 
 class State(BaseModel):
     joint_angles: Optional[List[float]]  # degrees, one per actuator, base->wrist order
