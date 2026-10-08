@@ -760,6 +760,37 @@ class GUI(UI):
                 "inference/action_joint",
                 rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6, gripper]),
             )
+
+    def report_twist_command(
+        self, *, command_id: int, reference_frame: int, linear_velocity: list[float],
+        angular_velocity: list[float], duration: int, send_duration_ms: float,
+        result: str, succeeded: bool, error: Optional[str],
+    ) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/twist/command_id", rr.Scalars(command_id))
+        rr.log("inference/twist/reference_frame", rr.Scalars(reference_frame))
+        rr.log("inference/twist/linear_velocity_m_s", rr.Scalars(linear_velocity))
+        rr.log("inference/twist/angular_velocity", rr.Scalars(angular_velocity))
+        rr.log("inference/twist/duration", rr.Scalars(duration))
+        rr.log("inference/twist/send_duration_ms", rr.Scalars(send_duration_ms))
+        rr.log("inference/twist/send_result", rr.TextLog(f"command {command_id}: {result}"))
+        rr.log("inference/twist/send_succeeded", rr.Scalars(1.0 if succeeded else 0.0))
+        if error is not None:
+            rr.log("inference/twist/send_error", rr.TextLog(f"command {command_id}: {error}", level="error"))
+
+    def report_twist_feedback(
+        self, *, command_id: int, feedback_sequence: int, pose: "Pose", delay_ms: float,
+    ) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/twist_feedback/command_id", rr.Scalars(command_id))
+        rr.log("inference/twist_feedback/feedback_sequence", rr.Scalars(feedback_sequence))
+        rr.log("inference/twist_feedback/delay_ms", rr.Scalars(delay_ms))
+        rr.log("inference/twist_feedback/position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("inference/twist_feedback/orientation_wxyz", rr.Scalars([
+            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
+        ]))
     # ------------------------------------------------------------------ #
     # display setup
     # ------------------------------------------------------------------ #
