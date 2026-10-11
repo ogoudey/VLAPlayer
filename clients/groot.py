@@ -32,7 +32,7 @@ class GrootConfig(Enum):
 @dataclass
 class GrootN17ServerConfiguration(ServerConfiguration):
     config: GrootConfig # observation/action layout must match the server checkpoint
-    EXECUTION_HORIZON = 8 # This should be editable in the GUI
+    execution_horizon: int = 8
     timeout_ms: int = 15000
 
     _client: Optional[PolicyClient] = field(default=None, init=False, repr=False, compare=False)
@@ -658,7 +658,7 @@ class RecordedGrootConfiguration(GrootN17ServerConfiguration):
             raise RecordedReplayStopped(f"Recorded episode complete ({len(frames)} frames)")
         if self.response_delay_s:
             time_package.sleep(self.response_delay_s)
-        end = min(self.cursor + GrootN17ServerConfiguration.EXECUTION_HORIZON, len(frames))
+        end = min(self.cursor + self.execution_horizon, len(frames))
         if self.absolute_targets is not None:
             if self._fixed_orientation is None:
                 pose = observation.state.target_pose
@@ -765,7 +765,7 @@ class GrootN17Client(Client):
                     time_package.sleep(0.5)
                     continue
                 action_queue.queue.clear()  # clear any stale actions from the queue
-                for action in chunk.actions[:GrootN17ServerConfiguration.EXECUTION_HORIZON]:
+                for action in chunk.actions[:self.server.execution_horizon]:
                     action_queue.put(action)
                 self.ui.report_loop_event(f"Received chunk of {len(chunk.actions)} actions")
                 self.ui.report_queue_depth(action_queue.qsize())

@@ -7,6 +7,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("recording_path", nargs="?", help="Rerun recording output")
 parser.add_argument("--twist", action="store_true",
                     help="Execute actions with apply_action instead of waiting for waypoints")
+parser.add_argument("--execution-horizon", type=int, default=8,
+                    help="Maximum actions to execute per prediction chunk (default: 8)")
 parser.add_argument("--replay-episode", nargs="?", type=Path,
                     const=Path(__file__).parent / "data/replay/eggplant_episode_002/episode.json",
                     help="Feed recorded actions into the GR00T loop (default: eggplant episode 2)")
@@ -19,6 +21,8 @@ parser.add_argument("--replay-delay", type=float, default=0.0,
 parser.add_argument("--dt", "--control-period", dest="control_period_s", type=float, default=0.02,
                     help="Action/control period in seconds (default: dataset period for replay, 0.02 otherwise)")
 args = parser.parse_args()
+if args.execution_horizon <= 0:
+    parser.error("--execution-horizon must be a positive integer")
 if args.replay_targets_csv is not None and args.replay_episode is None:
     args.replay_episode = Path(__file__).parent / "data/replay/eggplant_episode_002/episode.json"
 if args.control_period_s is not None and (
@@ -45,6 +49,7 @@ else:
     remote = GrootN17ServerConfiguration(ip="192.168.0.196", port=5555, config=GrootConfig.EEF_ROT6D_ABS_IN_OUT, timeout_ms=15000)
     control_period_s = args.control_period_s or 0.02
 print(f"Control period dt: {control_period_s:g} s")
+remote.execution_horizon = args.execution_horizon
 client = GrootN17Client(remote=remote, twist=args.twist)
 
 """

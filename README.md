@@ -12,6 +12,11 @@ The `dt (seconds)` field below Gain starts at the launch-time `--dt` value.
 Changing it updates the control period for the next action without restarting.
 An in-progress waypoint or sleep finishes first. Recorded replay still checks
 the dataset period unless launched with an explicit `--dt` override.
+Use `--execution-horizon 16` to execute up to 16 actions per prediction (default:
+8). The Execution horizon field below dt changes this limit for the next chunk;
+already queued actions finish with the previous limit. If fewer actions are
+returned, all available actions are executed. This setting also controls the
+chunk size for recorded replay through `play.py`.
 ## Configuring
 Re-write `play.py`
 

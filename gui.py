@@ -134,6 +134,11 @@ _PAGE_TEMPLATE = """<!doctype html>
                 style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35;
                         background: #1a1d24; color: #fff; box-sizing: border-box; width: 100%; margin-top: 4px;" />
       </label>
+      <label style="font-size: 13px; color: #c4c9d4;">execution horizon (actions)
+        <input type="number" id="execution-horizon" step="1" min="1" disabled
+                style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35;
+                        background: #1a1d24; color: #fff; box-sizing: border-box; width: 100%; margin-top: 4px;" />
+      </label>
       <button id="start-btn">Start</button>
 
       <button id="gohome-btn" style="display:none; background:#6b5ce6;">Go To Home</button>
@@ -154,6 +159,29 @@ _PAGE_TEMPLATE = """<!doctype html>
     const inputPrompt = document.getElementById("prompt");
     const inputGain = document.getElementById("gain");
     const inputDt = document.getElementById("dt");
+    const inputHorizon = document.getElementById("execution-horizon");
+    inputHorizon.addEventListener("change", async () => {{
+        const value = Number(inputHorizon.value);
+        if (!Number.isSafeInteger(value) || value <= 0) {{
+            inputHorizon.setCustomValidity("Enter a positive integer.");
+            inputHorizon.reportValidity();
+            return;
+        }}
+        inputHorizon.setCustomValidity("");
+        try {{
+            const response = await fetch("/api/execution-horizon", {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/json" }},
+                body: JSON.stringify({{ execution_horizon: value }}),
+            }});
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || "Unable to update execution horizon");
+            inputHorizon.value = result.execution_horizon;
+        }} catch (error) {{
+            inputHorizon.setCustomValidity(error.message);
+            inputHorizon.reportValidity();
+        }}
+    }});
     inputDt.addEventListener("change", async () => {{
         const value = Number(inputDt.value);
         if (!Number.isFinite(value) || value <= 0) {{
@@ -248,6 +276,10 @@ _PAGE_TEMPLATE = """<!doctype html>
             inputGain.value = s.gain;
         }}
         inputDt.disabled = s.dt === null;
+        inputHorizon.disabled = s.execution_horizon === null;
+        if (document.activeElement !== inputHorizon && s.execution_horizon !== null) {{
+            inputHorizon.value = s.execution_horizon;
+        }}
         if (document.activeElement !== inputDt && s.dt !== null) {{
             inputDt.value = s.dt;
         }}
@@ -1045,6 +1077,11 @@ class GUI(UI):
     def _build_http_app(self) -> FastAPI:
         app = FastAPI()
 
+        def horizon_server():
+            client = getattr(self._player, "client", None) if self._player is not None else self.client
+            server = getattr(client, "server", None)
+            return server if hasattr(server, "execution_horizon") else None
+
         @app.get("/", response_class=HTMLResponse)
         def index():
             return self._render_page()
@@ -1065,6 +1102,8 @@ class GUI(UI):
                 status = dict(self._status)
             connection = self._player.connection if self._player is not None else self.connection
             status["dt"] = connection.control_period_s if connection is not None else None
+            server = horizon_server()
+            status["execution_horizon"] = server.execution_horizon if server is not None else None
             return JSONResponse(status)
 
         @app.post("/api/toggle")
@@ -1104,6 +1143,17 @@ class GUI(UI):
                 return JSONResponse({"error": "No robot connection is bound"}, status_code=409)
             connection.control_period_s = value
             return JSONResponse({"dt": value})
+
+        @app.post("/api/execution-horizon")
+        def api_execution_horizon(payload: dict = Body(...)):
+            value = payload.get("execution_horizon")
+            if type(value) is not int or value <= 0:
+                return JSONResponse({"error": "execution horizon must be a positive integer"}, status_code=400)
+            server = horizon_server()
+            if server is None:
+                return JSONResponse({"error": "No GR00T client is bound"}, status_code=409)
+            server.execution_horizon = value
+            return JSONResponse({"execution_horizon": value})
 
         return app
 
