@@ -5,6 +5,8 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser()
 parser.add_argument("recording_path", nargs="?", help="Rerun recording output")
+parser.add_argument("--twist", action="store_true",
+                    help="Execute actions with apply_action instead of waiting for waypoints")
 parser.add_argument("--replay-episode", nargs="?", type=Path,
                     const=Path(__file__).parent / "data/replay/eggplant_episode_002/episode.json",
                     help="Feed recorded actions into the GR00T loop (default: eggplant episode 2)")
@@ -43,7 +45,7 @@ else:
     remote = GrootN17ServerConfiguration(ip="192.168.0.196", port=5555, config=GrootConfig.THREE_TASKS_2_FIXED_LORA, timeout_ms=15000)
     control_period_s = args.control_period_s or 0.02
 print(f"Control period dt: {control_period_s:g} s")
-client = GrootN17Client(remote=remote)
+client = GrootN17Client(remote=remote, twist=args.twist)
 
 """
 IF the state pose does not follow the target pose, expose the twists.
@@ -51,7 +53,7 @@ IF the state pose does not follow the target pose, expose the twists.
 
 """
 Server:
-uv run python gr00t/eval/run_gr00t_server.py --model-path /home/hrilab/Isaac-GR00T/Models/gr00t_tabletop_3tasks_rot6d_LoRA  --embodiment-tag NEW_EMBODIMENT --device cuda:0
+uv run python gr00t/eval/run_gr00t_server.py --model-path /home/hrilab/Isaac-GR00T/Models/gr00t_3tasks_abs_rot6d_Lora  --embodiment-tag NEW_EMBODIMENT --device cuda:0
 """
 
 

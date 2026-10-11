@@ -27,10 +27,11 @@ class GrootConfig(Enum):
     THREE_TASKS_ABS_DELTAS_LORA = "THREE_TASKS_ABS_DELTAS_LORA"
     THREE_TASKS_2_ABS_DELTAS_LORA = "THREE_TASKS_2_ABS_DELTAS_LORA"
     THREE_TASKS_2_FIXED_LORA = "THREE_TASKS_2_FIXED_LORA"
+    EEF_ROT6D_ABS_IN_OUT = "EEF_ROT6D_ABS_IN_OUT"
 
 @dataclass
 class GrootN17ServerConfiguration(ServerConfiguration):
-    config: GrootConfig # must match --embodiment-tag on the server
+    config: GrootConfig # observation/action layout must match the server checkpoint
     EXECUTION_HORIZON = 8 # This should be editable in the GUI
     timeout_ms: int = 15000
 
@@ -196,6 +197,28 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                         "sub_task": [[observation.language]],
                     },
                 }
+            case GrootConfig.EEF_ROT6D_ABS_IN_OUT:
+                pose = observation.state.target_pose
+                eef_pose = np.concatenate([
+                    np.array([pose.x, pose.y, pose.z], dtype=np.float32),
+                    self._eef_6d_rot_first_two_rows(pose),
+                ])
+                return {
+                    "video": {
+                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
+                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
+                    },
+                    "state": {
+                        "arm_joints": self._add_batch_and_time_dims(
+                            np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
+                        ),
+                        "eef_pose": self._add_batch_and_time_dims(eef_pose),
+                        "gripper": self._add_batch_and_time_dims(
+                            np.array([observation.state.gripper], dtype=np.float32)
+                        ),
+                    },
+                    "language": {"sub_task": [[observation.language]]},
+                }
             case GrootConfig.THREE_TASKS_REL_ROT6D_LORA:
                 joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
 
@@ -347,6 +370,20 @@ class GrootN17ServerConfiguration(ServerConfiguration):
 
     def _from_gr00t_response(self, response: dict, observation: Optional[Observation] = None) -> ActionChunk:
         match self.config:
+            case GrootConfig.EEF_ROT6D_ABS_IN_OUT:
+                poses = np.asarray(response["eef_pose_targets"])[0]  # (T, 9), absolute XYZ + row rot6D
+                grippers = np.asarray(response["gripper_targets"])[0]  # (T, 1)
+                actions = []
+                for pose, gripper in zip(poses, grippers):
+                    eef = EndEffectorPose.from_action_format(pose, ActionFormat.XYZ_ROT6D)
+                    quat = eef.to_rotation("quat", "xyzw")
+                    actions.append(PoseTarget(
+                        x=float(pose[0]), y=float(pose[1]), z=float(pose[2]),
+                        theta_x=float(quat[0]), theta_y=float(quat[1]),
+                        theta_z=float(quat[2]), theta_w=float(quat[3]),
+                        gripper_command=float(gripper[0]),
+                    ))
+                return ActionChunk(actions=actions)
             case GrootConfig.THREE_TASKS_2_ABS_DELTAS_LORA | GrootConfig.THREE_TASKS_2_FIXED_LORA:
                 delta_pos = np.asarray(response["pos_delta"])[0]
                 #delta_rot = np.asarray(response["rot_delta"])[0]
@@ -679,8 +716,9 @@ class GrootN17Client(Client):
     """
     Same as PI client actually
     """
-    def __init__(self, remote: Optional[ServerConfiguration]=None):
+    def __init__(self, remote: Optional[ServerConfiguration]=None, *, twist: bool = False):
         super().__init__()
+        self.twist = twist
         if remote is None:
             # ignore for now
             pass
@@ -741,9 +779,10 @@ class GrootN17Client(Client):
                     continue
                 if isinstance(self.server, RecordedGrootConfiguration):
                     self.server.check_action(self.connection, action)
-                    self.connection.apply_action_waypoint(action)
-                else:
+                if self.twist:
                     self.connection.apply_action(action)
+                else:
+                    self.connection.apply_action_waypoint(action)
             except RecordedReplayStopped as e:
                 self.ui.report_loop_event(str(e), level="warn")
                 self.predicting = False

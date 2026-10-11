@@ -889,7 +889,7 @@ class GUI(UI):
                         ),
                         auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
                     )
-                case GrootConfig.THREE_TASKS_REL_ROT6D_LORA:
+                case GrootConfig.THREE_TASKS_REL_ROT6D_LORA | GrootConfig.EEF_ROT6D_ABS_IN_OUT:
                     return rrb.Blueprint(
                         rrb.Grid(
                             rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),

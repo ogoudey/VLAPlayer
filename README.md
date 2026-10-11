@@ -4,6 +4,10 @@
 ```
 python3 play.py
 ```
+
+GR00T actions use `apply_action_waypoint` by default, waiting for each waypoint
+to complete. Run `python3 play.py --twist` to use `apply_action` instead.
+This option also applies to recorded episodes played through `play.py`.
 ## Configuring
 Re-write `play.py`
 
@@ -55,6 +59,23 @@ For this episode, ideal integration of the Z commands at gain 1 with the existin
 The recorded trajectory only reaches **0.0448 m**. This assumes exact velocity
 tracking and matching tool frames; it is not a prediction of the real trajectory.
 The exported deltas remain unchanged so replay can test this controller mismatch.
+
+## Absolute EEF rot6D inference
+
+Set `config=GrootConfig.EEF_ROT6D_ABS_IN_OUT` in the remote configuration in
+`play.py` for a checkpoint with absolute XYZ + rot6D state and action poses.
+The state key is `eef_pose` with shape `(1, 1, 9)`; the server response keys
+are `eef_pose_targets` with shape `(1, T, 9)` and `gripper_targets` with shape
+`(1, T, 1)`. Both rotations use the first two **rows** of the rotation matrix,
+flattened, matching the training conversion. State joints are sent in radians.
+Returned poses are decoded into absolute quaternion `PoseTarget` actions;
+gripper targets are passed through as absolute commands. The inference loop
+executes these poses through `apply_action_waypoint` by default, waiting for each
+waypoint to complete before sending the next. Use `--twist` to use `apply_action`.
+
+Select the checkpoint separately using the server's `--model-path`, and use
+the embodiment tag saved in its processor. This client config selects the
+wire layout; it does not select weights or send an embodiment tag.
 
 ## Replay through the GR00T inference loop
 
