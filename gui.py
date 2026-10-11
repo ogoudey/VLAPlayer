@@ -791,6 +791,30 @@ class GUI(UI):
         rr.log("inference/twist_feedback/orientation_wxyz", rr.Scalars([
             pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
         ]))
+
+    def report_waypoint_target(self, *, command_id: int, pose: "Pose") -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/waypoint/command_id", rr.Scalars(command_id))
+        rr.log("inference/waypoint/target_position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("inference/waypoint/target_orientation_wxyz", rr.Scalars([
+            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
+        ]))
+
+    def report_waypoint_result(
+        self, *, command_id: int, pose: "Pose", position_error_m: float,
+        orientation_error_deg: float, duration_ms: float,
+    ) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/waypoint/result_command_id", rr.Scalars(command_id))
+        rr.log("inference/waypoint/achieved_position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("inference/waypoint/achieved_orientation_wxyz", rr.Scalars([
+            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
+        ]))
+        rr.log("inference/waypoint/position_error_m", rr.Scalars(position_error_m))
+        rr.log("inference/waypoint/orientation_error_deg", rr.Scalars(orientation_error_deg))
+        rr.log("inference/waypoint/duration_ms", rr.Scalars(duration_ms))
     # ------------------------------------------------------------------ #
     # display setup
     # ------------------------------------------------------------------ #
