@@ -771,6 +771,10 @@ class GrootN17Client(Client):
                 self.ui.report_queue_depth(action_queue.qsize())
 
             action = action_queue.get()
+            current_period = self.connection.control_period_s
+            if current_period != period:
+                period = current_period
+                next_tick = time_package.monotonic()
             self.ui.report_queue_depth(action_queue.qsize())
             self.ui.report_applied_action(action)
             try:

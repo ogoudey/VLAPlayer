@@ -68,6 +68,7 @@ are None or don't implement these; the poller just skips them.
 from __future__ import annotations
 
 import threading
+import math
 import time
 import urllib.parse
 from typing import Any, Dict, Optional
@@ -128,6 +129,11 @@ _PAGE_TEMPLATE = """<!doctype html>
                 style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35;
                         background: #1a1d24; color: #fff; box-sizing: border-box; width: 100%; margin-top: 4px;" />
         </label>
+      <label style="font-size: 13px; color: #c4c9d4;">dt (seconds)
+        <input type="number" id="dt" step="0.01" min="0.001" disabled
+                style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35;
+                        background: #1a1d24; color: #fff; box-sizing: border-box; width: 100%; margin-top: 4px;" />
+      </label>
       <button id="start-btn">Start</button>
 
       <button id="gohome-btn" style="display:none; background:#6b5ce6;">Go To Home</button>
@@ -147,6 +153,29 @@ _PAGE_TEMPLATE = """<!doctype html>
     const btnStart = document.getElementById("start-btn");
     const inputPrompt = document.getElementById("prompt");
     const inputGain = document.getElementById("gain");
+    const inputDt = document.getElementById("dt");
+    inputDt.addEventListener("change", async () => {{
+        const value = Number(inputDt.value);
+        if (!Number.isFinite(value) || value <= 0) {{
+            inputDt.setCustomValidity("Enter a positive number of seconds.");
+            inputDt.reportValidity();
+            return;
+        }}
+        inputDt.setCustomValidity("");
+        try {{
+            const response = await fetch("/api/dt", {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/json" }},
+                body: JSON.stringify({{ dt: value }}),
+            }});
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || "Unable to update dt");
+            inputDt.value = result.dt;
+        }} catch (error) {{
+            inputDt.setCustomValidity(error.message);
+            inputDt.reportValidity();
+        }}
+    }});
     inputGain.addEventListener("change", () => {{
         const value = parseFloat(inputGain.value);
         if (!isNaN(value)) {{
@@ -217,6 +246,10 @@ _PAGE_TEMPLATE = """<!doctype html>
 
         if (document.activeElement !== inputGain) {{
             inputGain.value = s.gain;
+        }}
+        inputDt.disabled = s.dt === null;
+        if (document.activeElement !== inputDt && s.dt !== null) {{
+            inputDt.value = s.dt;
         }}
         
         const dot = document.getElementById("conn-dot");
@@ -1029,7 +1062,10 @@ class GUI(UI):
         @app.get("/api/status")
         def api_status():
             with self._status_lock:
-                return JSONResponse(dict(self._status))
+                status = dict(self._status)
+            connection = self._player.connection if self._player is not None else self.connection
+            status["dt"] = connection.control_period_s if connection is not None else None
+            return JSONResponse(status)
 
         @app.post("/api/toggle")
         def api_toggle(payload: dict = Body(...)):
@@ -1054,6 +1090,20 @@ class GUI(UI):
             with self._status_lock:
                 self._status["gain"] = value
             return JSONResponse({"gain": value})
+
+        @app.post("/api/dt")
+        def api_dt(payload: dict = Body(...)):
+            try:
+                value = float(payload["dt"])
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return JSONResponse({"error": "dt must be a finite positive number of seconds"}, status_code=400)
+            connection = self._player.connection if self._player is not None else self.connection
+            if connection is None:
+                return JSONResponse({"error": "No robot connection is bound"}, status_code=409)
+            connection.control_period_s = value
+            return JSONResponse({"dt": value})
 
         return app
 

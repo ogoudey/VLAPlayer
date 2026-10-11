@@ -8,6 +8,10 @@ python3 play.py
 GR00T actions use `apply_action_waypoint` by default, waiting for each waypoint
 to complete. Run `python3 play.py --twist` to use `apply_action` instead.
 This option also applies to recorded episodes played through `play.py`.
+The `dt (seconds)` field below Gain starts at the launch-time `--dt` value.
+Changing it updates the control period for the next action without restarting.
+An in-progress waypoint or sleep finishes first. Recorded replay still checks
+the dataset period unless launched with an explicit `--dt` override.
 ## Configuring
 Re-write `play.py`
 

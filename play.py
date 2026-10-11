@@ -16,7 +16,7 @@ parser.add_argument("--replay-targets-csv", nargs="?", type=Path,
                     help="Replay exact absolute XYZ targets from CSV with a fixed starting orientation")
 parser.add_argument("--replay-delay", type=float, default=0.0,
                     help="Simulated server latency in seconds per recorded chunk")
-parser.add_argument("--dt", "--control-period", dest="control_period_s", type=float,
+parser.add_argument("--dt", "--control-period", dest="control_period_s", type=float, default=0.02,
                     help="Action/control period in seconds (default: dataset period for replay, 0.02 otherwise)")
 args = parser.parse_args()
 if args.replay_targets_csv is not None and args.replay_episode is None:
@@ -42,7 +42,7 @@ if args.replay_episode is not None:
         print(f"Absolute XYZ targets: {args.replay_targets_csv}; orientation fixed at replay start")
     control_period_s = args.control_period_s or 1.0 / remote.episode["fps"]
 else:
-    remote = GrootN17ServerConfiguration(ip="192.168.0.196", port=5555, config=GrootConfig.THREE_TASKS_2_FIXED_LORA, timeout_ms=15000)
+    remote = GrootN17ServerConfiguration(ip="192.168.0.196", port=5555, config=GrootConfig.EEF_ROT6D_ABS_IN_OUT, timeout_ms=15000)
     control_period_s = args.control_period_s or 0.02
 print(f"Control period dt: {control_period_s:g} s")
 client = GrootN17Client(remote=remote, twist=args.twist)
@@ -53,7 +53,7 @@ IF the state pose does not follow the target pose, expose the twists.
 
 """
 Server:
-uv run python gr00t/eval/run_gr00t_server.py --model-path /home/hrilab/Isaac-GR00T/Models/gr00t_3tasks_abs_rot6d_Lora  --embodiment-tag NEW_EMBODIMENT --device cuda:0
+uv run python gr00t/eval/run_gr00t_server.py --model-path /home/hrilab/Isaac-GR00T/Models/gr00t_3tasks_abs_rot6d_lora  --embodiment-tag NEW_EMBODIMENT --device cuda:0
 """
 
 
