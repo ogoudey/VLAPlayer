@@ -564,6 +564,117 @@ class GrootN17ServerConfiguration(ServerConfiguration):
             gripper_command=gripper_command,
         )
 
+class RecordedReplayStopped(Exception):
+    """A recorded episode finished, or its replay checks stopped execution."""
+
+
+class RecordedGrootConfiguration(GrootN17ServerConfiguration):
+    """Supply consecutive dataset rows at the normal prediction boundary."""
+
+    def __init__(
+        self, episode_path, *, min_z: float, response_delay_s: float = 0.0,
+        allow_control_period_override: bool = False,
+        absolute_targets_csv=None,
+    ):
+        from replay_episode import load_episode
+
+        super().__init__(ip="recorded", port=0, config=GrootConfig.THREE_TASKS_2_FIXED_LORA)
+        if not np.isfinite(min_z):
+            raise ValueError("Replay min_z must be finite")
+        if not np.isfinite(response_delay_s) or response_delay_s < 0:
+            raise ValueError("Replay response delay must be finite and nonnegative")
+        self.episode = load_episode(episode_path)
+        self.min_z = min_z
+        self.response_delay_s = response_delay_s
+        self.allow_control_period_override = allow_control_period_override
+        self.cursor = 0
+        self._start_checked = False
+        self.absolute_targets = None
+        self._fixed_orientation = None
+        if absolute_targets_csv is not None:
+            import csv
+            from pathlib import Path
+
+            with Path(absolute_targets_csv).open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            if len(rows) != len(self.episode["frames"]):
+                raise ValueError("Absolute target CSV must contain one row per episode frame")
+            self.absolute_targets = []
+            for i, row in enumerate(rows):
+                xyz = [float(row[f"target_{axis}_m"]) for axis in "xyz"]
+                if int(row["frame_index"]) != i or not np.all(np.isfinite(xyz)):
+                    raise ValueError(f"Invalid absolute target CSV frame {i}")
+                self.absolute_targets.append(xyz)
+
+    def ping(self) -> bool:
+        return True
+
+    def test_health(self, timeout: float = 3.0) -> bool:
+        return True
+
+    def start_server(self):
+        return True
+
+    def make_prediction(self, observation: Observation) -> ActionChunk:
+        frames = self.episode["frames"]
+        if self.cursor >= len(frames):
+            raise RecordedReplayStopped(f"Recorded episode complete ({len(frames)} frames)")
+        if self.response_delay_s:
+            time_package.sleep(self.response_delay_s)
+        end = min(self.cursor + GrootN17ServerConfiguration.EXECUTION_HORIZON, len(frames))
+        if self.absolute_targets is not None:
+            if self._fixed_orientation is None:
+                pose = observation.state.target_pose
+                self._fixed_orientation = {
+                    key: getattr(pose, key)
+                    for key in ("theta_x", "theta_y", "theta_z", "theta_w")
+                }
+            chunk = ActionChunk(actions=[
+                PoseTarget(
+                    x=self.absolute_targets[i][0], y=self.absolute_targets[i][1],
+                    z=self.absolute_targets[i][2], **self._fixed_orientation,
+                    gripper_command=frames[i]["action"][6],
+                ) for i in range(self.cursor, end)
+            ])
+        else:
+            values = np.asarray([f["action"] for f in frames[self.cursor:end]], dtype=np.float64)
+            # Feed the same raw response fields through the production decoder.
+            response = {"pos_delta": values[None, :, :3],
+                        "rot_delta": values[None, :, 3:6],
+                        "gripper": values[None, :, 6:7]}
+            chunk = self._from_gr00t_response(response, observation=observation)
+        print(f"[recorded] episode={self.episode['episode_index']} frames={self.cursor}:{end}")
+        self.cursor = end
+        return chunk
+
+    def check_action(self, connection, action):
+        dt = connection.control_period_s
+        if not self.allow_control_period_override and not np.isclose(dt, 1 / self.episode["fps"]):
+            raise RecordedReplayStopped("Replay control period does not match dataset fps")
+        state = connection.state()
+        if not self._start_checked:
+            expected = np.degrees(self.episode["frames"][0]["observation.state"][:7])
+            measured = np.asarray(state.joint_angles)
+            if measured.shape != (7,) or not np.all(np.isfinite(measured)):
+                raise RecordedReplayStopped("Replay requires valid joint feedback")
+            error = np.abs((measured - expected + 180) % 360 - 180)
+            if np.max(error) > 5:
+                raise RecordedReplayStopped(f"Replay start joints differ by {np.max(error):.1f} degrees")
+            self._start_checked = True
+        z = state.target_pose.z
+        if isinstance(action, PoseTarget):
+            next_z = action.z
+        else:
+            gain = connection.ui.gain if connection.ui is not None else 1.0
+            vz = np.clip(gain * action.dz / dt,
+                         -connection.max_linear_velocity, connection.max_linear_velocity)
+            next_z = z + vz * dt
+        if not np.isfinite(z) or not np.isfinite(next_z) or min(z, next_z) <= self.min_z:
+            raise RecordedReplayStopped(
+                f"Replay stopped at tool Z={z:.4f} m, target Z={next_z:.4f} m (min-z={self.min_z})"
+            )
+
+
 class GrootN17Client(Client):
     """
     Same as PI client actually
@@ -589,6 +700,7 @@ class GrootN17Client(Client):
 
         while not self._stop_inference.is_set():
             if not self.predicting:
+                action_queue.queue.clear()
                 time_package.sleep(0.05)
                 next_tick = time_package.monotonic()
                 continue
@@ -602,6 +714,10 @@ class GrootN17Client(Client):
                     predict_start = time_package.monotonic()
                     chunk = self.server.make_prediction(observation=self.get_observation())
                     self.ui.report_client_latency((time_package.monotonic() - predict_start) * 1000)
+                except RecordedReplayStopped as e:
+                    self.ui.report_loop_event(str(e))
+                    self.predicting = False
+                    break
                 except Exception as e:
                     self.ui.report_loop_event(f"Prediction request failed, retrying: {e}", level="warn")
                     time_package.sleep(0.5)
@@ -621,10 +737,22 @@ class GrootN17Client(Client):
             self.ui.report_applied_action(action)
             try:
                 if not self.predicting:
+                    action_queue.queue.clear()
                     continue
-                self.connection.apply_action(action)
+                if isinstance(self.server, RecordedGrootConfiguration):
+                    self.server.check_action(self.connection, action)
+                    self.connection.apply_action_waypoint(action)
+                else:
+                    self.connection.apply_action(action)
+            except RecordedReplayStopped as e:
+                self.ui.report_loop_event(str(e), level="warn")
+                self.predicting = False
+                break
             except Exception as e:
                 self.ui.report_loop_event(f"apply_action failed, skipping: {e}", level="warn")
+                if isinstance(self.server, RecordedGrootConfiguration):
+                    self.predicting = False
+                    break
             
             tick_start = time_package.monotonic()
             next_tick += period

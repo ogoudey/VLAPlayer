@@ -84,6 +84,7 @@ class KinovaConnection(Connection):
     HOME_ACTION_NAME = 'Retract'    # factory default — check the Kinova web app's Actions list if this errors
     FEEDBACK_POLL_HZ = 100.0
     HOME_ACTION_TIMEOUT_S = 20.0
+    WAYPOINT_TIMEOUT_S = 10.0
 
     def __init__(self, control_period_s=0.02, max_linear_velocity=0.15,
                  max_angular_velocity=30.0, max_joint_velocity_deg_s=30.0, **kwargs):
@@ -136,13 +137,18 @@ class KinovaConnection(Connection):
 
         self._feedback_lock = threading.Lock()
         self._latest_feedback = self.base_feedback
+        self._feedback_sequence = 0
+        self._twist_command_sequence = 0
+        self._pending_twist_feedback = {}
+        self._waypoint_command_sequence = 0
         self.control_period_s = control_period_s        # expected seconds between apply_action() calls
         self.max_linear_velocity = max_linear_velocity   # m/s safety clamp
         self.max_angular_velocity = max_angular_velocity # deg/s safety clamp
         self.max_joint_velocity_deg_s = max_joint_velocity_deg_s  # deg/s safety clamp — Kinova's own default is 30 deg/s, but the arm can do more if you want to risk it
 
-    def awake(self):
-        self.move_to_home()
+    def awake(self, *, home=True):
+        if home:
+            self.move_to_home()
         self.kill_the_thread = False
         self.cyclic_thread = threading.Thread(target=self._feedback_poll_loop, daemon=True)
         self.cyclic_thread.start()
@@ -158,8 +164,27 @@ class KinovaConnection(Connection):
                 print("Feedback refresh failed:", e)
                 time.sleep(period)
                 continue
+            feedback_time = time.monotonic()
             with self._feedback_lock:
                 self._latest_feedback = feedback
+                self._feedback_sequence += 1
+                feedback_sequence = self._feedback_sequence
+                completed = [
+                    (command_id, trace)
+                    for command_id, trace in self._pending_twist_feedback.items()
+                    if feedback_sequence > trace["after_feedback_sequence"]
+                ]
+                for command_id, _ in completed:
+                    self._pending_twist_feedback.pop(command_id, None)
+            if completed and self.ui is not None and hasattr(self.ui, "report_twist_feedback"):
+                pose = self._pose_from_feedback(feedback)
+                for command_id, trace in completed:
+                    self.ui.report_twist_feedback(
+                        command_id=command_id,
+                        feedback_sequence=feedback_sequence,
+                        pose=pose,
+                        delay_ms=(feedback_time - trace["send_finished_monotonic"]) * 1000.0,
+                    )
             time.sleep(period)
         self.cyclic_running = False
 
@@ -209,6 +234,10 @@ class KinovaConnection(Connection):
         with self._feedback_lock:
             feedback = self._latest_feedback
 
+        return self._pose_from_feedback(feedback)
+
+    @staticmethod
+    def _pose_from_feedback(feedback):
         quat = Rotation.from_euler(
             "xyz", [feedback.base.tool_pose_theta_x, feedback.base.tool_pose_theta_y, feedback.base.tool_pose_theta_z], degrees=True
         ).as_quat().astype(np.float32)
@@ -223,6 +252,41 @@ class KinovaConnection(Connection):
             theta_z=quat[2],
         )
         return target_pose
+
+    def _send_twist_command(self, twist_cmd):
+        """Send and trace the exact twist, RPC outcome, and next feedback pose."""
+        with self._feedback_lock:
+            self._twist_command_sequence += 1
+            command_id = self._twist_command_sequence
+
+        send_started = time.monotonic()
+        error = None
+        result = None
+        try:
+            result = self.base.SendTwistCommand(twist_cmd)
+        except Exception as e:
+            error = e
+        send_finished = time.monotonic()
+        with self._feedback_lock:
+            self._pending_twist_feedback[command_id] = {
+                "after_feedback_sequence": self._feedback_sequence,
+                "send_finished_monotonic": send_finished,
+            }
+
+        if self.ui is not None and hasattr(self.ui, "report_twist_command"):
+            self.ui.report_twist_command(
+                command_id=command_id,
+                reference_frame=twist_cmd.reference_frame,
+                linear_velocity=[twist_cmd.twist.linear_x, twist_cmd.twist.linear_y, twist_cmd.twist.linear_z],
+                angular_velocity=[twist_cmd.twist.angular_x, twist_cmd.twist.angular_y, twist_cmd.twist.angular_z],
+                duration=twist_cmd.duration,
+                send_duration_ms=(send_finished - send_started) * 1000.0,
+                result=repr(result),
+                succeeded=error is None,
+                error=None if error is None else f"{type(error).__name__}: {error}",
+            )
+        if error is not None:
+            raise error
     
     def apply_action(self, action: Action):
         if isinstance(action, PoseTarget):
@@ -272,6 +336,174 @@ class KinovaConnection(Connection):
             raise TypeError(
                 f"KinovaConnection has no handler for action type {type(action).__name__!r}"
             )
+
+    def apply_action_waypoint(self, action: CartesianDelta | PoseTarget) -> None:
+        """Execute a delta or an exact absolute pose as a waypoint; wait for completion."""
+        if not isinstance(action, (CartesianDelta, PoseTarget)):
+            raise TypeError(
+                "Waypoint execution supports CartesianDelta and PoseTarget actions; "
+                f"got {type(action).__name__}"
+            )
+
+        dt = self.control_period_s
+        gain = self.ui.gain if self.ui is not None else 1.0
+        current = self._get_current_pose()
+        current_rotation = Rotation.from_quat([
+            current.theta_x, current.theta_y, current.theta_z, current.theta_w,
+        ])
+
+        current_position = np.array([current.x, current.y, current.z])
+        if isinstance(action, PoseTarget):
+            # Absolute CSV targets must remain exact: gain/dt displacement
+            # clamps apply only to delta actions. Waypoint speeds still limit motion.
+            target_position = np.array([action.x, action.y, action.z], dtype=float)
+            target_rotation = Rotation.from_quat([
+                action.theta_x, action.theta_y, action.theta_z, action.theta_w,
+            ])
+            delta_position = target_position - current_position
+            delta_rotvec = (current_rotation.inv() * target_rotation).as_rotvec(degrees=True)
+        else:
+            max_step_m = self.max_linear_velocity * dt
+            delta_position = np.clip(
+                gain * np.array([action.dx, action.dy, action.dz], dtype=float),
+                -max_step_m, max_step_m,
+            )
+            target_position = current_position + delta_position
+            # CartesianDelta rotations are tool-local rotvecs in degrees.
+            delta_rotvec = gain * np.array(
+                [action.d_theta_x, action.d_theta_y, action.d_theta_z], dtype=float,
+            )
+            target_rotation = current_rotation * Rotation.from_rotvec(np.deg2rad(delta_rotvec))
+        if not np.all(np.isfinite(target_position)):
+            raise ValueError("Waypoint target position must be finite")
+        theta_x, theta_y, theta_z = target_rotation.as_euler("xyz", degrees=True)
+        target_quat = target_rotation.as_quat()
+        target_pose = Pose(
+            x=float(target_position[0]),
+            y=float(target_position[1]),
+            z=float(target_position[2]),
+            theta_w=float(target_quat[3]),
+            theta_x=float(target_quat[0]),
+            theta_y=float(target_quat[1]),
+            theta_z=float(target_quat[2]),
+        )
+
+        self._waypoint_command_sequence += 1
+        command_id = self._waypoint_command_sequence
+        if self.ui is not None and hasattr(self.ui, "report_waypoint_target"):
+            self.ui.report_waypoint_target(command_id=command_id, pose=target_pose)
+
+        if np.linalg.norm(delta_position) < 1e-6 and np.linalg.norm(delta_rotvec) < 1e-4:
+            # Keep a target/result pair even when the arm is already at the
+            # requested pose, so the CSV comparison has no missing frames.
+            if self.ui is not None and hasattr(self.ui, "report_waypoint_result"):
+                self.ui.report_waypoint_result(
+                    command_id=command_id, pose=current,
+                    position_error_m=float(np.linalg.norm(delta_position)),
+                    orientation_error_deg=float(np.linalg.norm(delta_rotvec)),
+                    duration_ms=0.0,
+                )
+            if action.gripper_command is not None:
+                self.handle_gripper_command(action.gripper_command)
+            return
+
+        waypoint_list = Base_pb2.WaypointList()
+        waypoint_list.use_optimal_blending = False
+        waypoint = waypoint_list.waypoints.add()
+        waypoint.name = "policy_cartesian_target"
+        cartesian = waypoint.cartesian_waypoint
+        cartesian.pose.x = float(target_position[0])
+        cartesian.pose.y = float(target_position[1])
+        cartesian.pose.z = float(target_position[2])
+        cartesian.pose.theta_x = float(theta_x)
+        cartesian.pose.theta_y = float(theta_y)
+        cartesian.pose.theta_z = float(theta_z)
+        cartesian.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+        cartesian.maximum_linear_velocity = float(self.max_linear_velocity)
+        # Request angular speed only when the waypoint changes orientation.
+        # Kortex validates this limit even when orientation is unchanged.
+        cartesian.maximum_angular_velocity = (
+            0.0 if np.linalg.norm(delta_rotvec) < 1e-4
+            else float(self.max_angular_velocity)
+        )
+        cartesian.blending_radius = 0.0
+
+        for _ in range(3):
+            validation = self.base.ValidateWaypointList(waypoint_list)
+            errors = validation.trajectory_error_report.trajectory_error_elements
+            if not errors:
+                break
+
+            # Kinova reports the active mode limit in max_value. Retry only
+            # speed-limit failures, staying 10% below each reported bound.
+            retryable = True
+            for error in errors:
+                if error.error_type == Base_pb2.TRAJECTORY_ERROR_TYPE_INVALID_CARTESIAN_LINEAR_VELOCITY:
+                    cartesian.maximum_linear_velocity = min(
+                        cartesian.maximum_linear_velocity, float(error.max_value) * 0.9,
+                    )
+                elif error.error_type == Base_pb2.TRAJECTORY_ERROR_TYPE_INVALID_CARTESIAN_ANGULAR_VELOCITY:
+                    cartesian.maximum_angular_velocity = min(
+                        cartesian.maximum_angular_velocity, float(error.max_value) * 0.9,
+                    )
+                else:
+                    retryable = False
+            if not retryable:
+                raise RuntimeError(
+                    f"Kinova rejected Cartesian waypoint: {validation.trajectory_error_report}"
+                )
+        else:
+            raise RuntimeError(f"Kinova rejected Cartesian waypoint: {validation.trajectory_error_report}")
+
+        completed = threading.Event()
+        outcome = {}
+
+        def on_action_notification(notification):
+            event = notification.action_event
+            if event in (Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT):
+                outcome["event"] = event
+                outcome["abort_details"] = notification.abort_details
+                completed.set()
+
+        notification_handle = self.base.OnNotificationActionTopic(
+            on_action_notification, Base_pb2.NotificationOptions(),
+        )
+        execute_started = time.monotonic()
+        try:
+            self.base.ExecuteWaypointTrajectory(waypoint_list)
+            if not completed.wait(self.WAYPOINT_TIMEOUT_S):
+                self.base.Stop()
+                raise TimeoutError(
+                    f"Kinova waypoint did not complete within {self.WAYPOINT_TIMEOUT_S:.1f} s"
+                )
+        finally:
+            self.base.Unsubscribe(notification_handle)
+
+        if outcome.get("event") == Base_pb2.ACTION_ABORT:
+            raise RuntimeError(f"Kinova aborted Cartesian waypoint: {outcome['abort_details']}")
+
+        achieved_pose = self._get_current_pose()
+        position_error_m = float(np.linalg.norm(
+            np.array([achieved_pose.x, achieved_pose.y, achieved_pose.z]) - target_position
+        ))
+        achieved_rotation = Rotation.from_quat([
+            achieved_pose.theta_x, achieved_pose.theta_y,
+            achieved_pose.theta_z, achieved_pose.theta_w,
+        ])
+        orientation_error_deg = float(
+            (target_rotation.inv() * achieved_rotation).magnitude() * 180.0 / math.pi
+        )
+        if self.ui is not None and hasattr(self.ui, "report_waypoint_result"):
+            self.ui.report_waypoint_result(
+                command_id=command_id,
+                pose=achieved_pose,
+                position_error_m=position_error_m,
+                orientation_error_deg=orientation_error_deg,
+                duration_ms=(time.monotonic() - execute_started) * 1000.0,
+            )
+
+        if action.gripper_command is not None:
+            self.handle_gripper_command(action.gripper_command)
     
     def pause(self) -> None:
         """Halt motion without touching the connection — safe to call
@@ -365,9 +597,9 @@ class KinovaConnection(Connection):
         twist_cmd.twist.angular_x = float(omega[0])
         twist_cmd.twist.angular_y = float(omega[1])
         twist_cmd.twist.angular_z = float(omega[2])
-        twist_cmd.duration = int(dt * 3.0)
+        twist_cmd.duration = 0 # explicitly set as 0
 
-        self.base.SendTwistCommand(twist_cmd)
+        self._send_twist_command(twist_cmd)
 
         if action.gripper_command is not None:
 
@@ -385,9 +617,9 @@ class KinovaConnection(Connection):
         twist_cmd.twist.angular_x = self._clamp(gain * action.d_theta_x / dt, self.max_angular_velocity)
         twist_cmd.twist.angular_y = self._clamp(gain * action.d_theta_y / dt, self.max_angular_velocity)
         twist_cmd.twist.angular_z = self._clamp(gain * action.d_theta_z / dt, self.max_angular_velocity)
-        twist_cmd.duration = int(dt * 3.0)
+        twist_cmd.duration = 0 # explicitly set as 0
 
-        self.base.SendTwistCommand(twist_cmd)
+        self._send_twist_command(twist_cmd)
 
         if action.gripper_obs_rel_delta is not None:
 
@@ -474,20 +706,6 @@ class KinovaConnection(Connection):
                 break
             time.sleep(0.01)
 
-    def _feedback_poll_loop(self):
-        period = 1.0 / self.FEEDBACK_POLL_HZ
-        while not self.kill_the_thread:
-            try:
-                feedback = self.base_cyclic.RefreshFeedback()
-            except Exception as e:
-                print("Feedback refresh failed:", e)
-                time.sleep(period)
-                continue
-            with self._feedback_lock:
-                self._latest_feedback = feedback
-            time.sleep(period)
-        self.cyclic_running = False
-
     def _wait_until_ready(self, timeout: float = 5.0) -> None:
         deadline = time.time() + timeout
         last_state = None
@@ -499,4 +717,3 @@ class KinovaConnection(Connection):
             time.sleep(0.05)
 
         state_name = Common_pb2.ArmState.Name(last_state) if last_state is not None else "UNKNOWN"
-        
