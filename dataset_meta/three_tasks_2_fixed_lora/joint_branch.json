@@ -1,0 +1,13 @@
+{
+  "period": 6.283185307179586,
+  "window_lo": [
+    -3.023638133202688,
+    -2.8912901023971003,
+    -6.3224516868512275,
+    -5.040146803847993,
+    -3.2025910357581537,
+    -3.610507700835363,
+    -1.4728048165612897
+  ],
+  "usage": "Extracted from THREE_TASKS_2_FIXED_LORA. training-time joint value = ((raw - window_lo) mod period) + window_lo, per joint; radians."
+}

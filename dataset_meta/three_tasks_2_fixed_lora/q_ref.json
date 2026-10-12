@@ -1,0 +1,9 @@
+{
+  "q_ref": [
+    0.7057592503866893,
+    0.7076099545579241,
+    0.024808814852628452,
+    0.024011568248638298
+  ],
+  "usage": "Extracted from THREE_TASKS_2_FIXED_LORA. XYZW quaternion reference; flip the state quaternion sign when its dot product with q_ref is negative."
+}
