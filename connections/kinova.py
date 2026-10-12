@@ -390,6 +390,12 @@ class KinovaConnection(Connection):
 
         self._waypoint_command_sequence += 1
         command_id = self._waypoint_command_sequence
+        print(
+            f"[waypoint] command_id={command_id}, reference_frame=BASE, "
+            f"position_m={target_position.tolist()}, "
+            f"orientation_xyz_deg={[float(theta_x), float(theta_y), float(theta_z)]}, "
+            f"gripper_received={action.gripper_command!r}"
+        )
         if self.ui is not None and hasattr(self.ui, "report_waypoint_target"):
             self.ui.report_waypoint_target(command_id=command_id, pose=target_pose)
 
@@ -579,7 +585,13 @@ class KinovaConnection(Connection):
     def handle_cartesian_delta(self, action: CartesianDelta):
         dt = self.control_period_s
         gain = self.ui.gain if self.ui is not None else 1.0
-        print(f"Gain: {gain}, dt: {dt}, action: {action}")
+        # Pause sends an empty delta between prediction chunks; keep those
+        # stop commands from obscuring the policy's waypoint targets.
+        if action.gripper_command is not None or any((
+            action.dx, action.dy, action.dz,
+            action.d_theta_x, action.d_theta_y, action.d_theta_z,
+        )):
+            print(f"Gain: {gain}, dt: {dt}, action: {action}")
 
         omega = gain * np.array([action.d_theta_x, action.d_theta_y, action.d_theta_z]) / dt
         #omega_norm = np.linalg.norm(omega)
@@ -653,7 +665,15 @@ class KinovaConnection(Connection):
         cmd.mode = Base_pb2.GRIPPER_POSITION  # position mode, as opposed to speed/force
         finger = cmd.gripper.finger.add()
         finger.finger_identifier = 0
-        finger.value = self._clamp(value_0_1, 1.0)  # Kinova's own convention — 0 = fully open, 100 = fully closed
+        finger.value = self._clamp(value_0_1, 1.0)
+        # Log before the RPC so rejected commands retain their raw input and
+        # the actual float32 value placed in the outgoing protobuf.
+        print(
+            f"[gripper] received={value_0_1!r}, commanded={finger.value!r}, "
+            f"mode=GRIPPER_POSITION, finger_identifier={finger.finger_identifier}"
+        )
+        if self.ui is not None and hasattr(self.ui, "report_gripper_command"):
+            self.ui.report_gripper_command(received=value_0_1, commanded=finger.value)
         self.base.SendGripperCommand(cmd)
 
     def list_actions(self) -> None:

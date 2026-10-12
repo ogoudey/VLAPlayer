@@ -857,6 +857,12 @@ class GUI(UI):
             pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
         ]))
 
+    def report_gripper_command(self, *, received: float, commanded: float) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/gripper_command/received", rr.Scalars(received))
+        rr.log("inference/gripper_command/commanded", rr.Scalars(commanded))
+
     def report_waypoint_target(self, *, command_id: int, pose: "Pose") -> None:
         if not self._display_active:
             return

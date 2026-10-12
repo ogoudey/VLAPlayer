@@ -2,7 +2,7 @@
 
 ## Running
 ```
-python3 play.py
+python3 play.py --joint-branch /path/to/joint_branch.json
 ```
 
 GR00T actions use `apply_action_waypoint` by default, waiting for each waypoint
@@ -19,6 +19,41 @@ returned, all available actions are executed. This setting also controls the
 chunk size for recorded replay through `play.py`.
 ## Configuring
 Re-write `play.py`
+
+Live inference requires the training reference matching the selected config:
+
+```bash
+python play.py --config EEF_ROT6D_ABS_IN_OUT --joint-branch /path/to/joint_branch.json --dt 1
+python play.py --config THREE_TASKS_2_FIXED_LORA --q-ref /path/to/q_ref.json
+```
+
+`joint_branch.json` contains seven joint window lower bounds in **radians**,
+either a JSON array or `{"joint_window_lo": [...]}` (`JOINT_WINDOW_LO` and
+`window_lo` are also accepted). The training export uses
+`{"period": 6.283185307179586, "window_lo": [...] , "usage": "..."}`.
+Joints are wrapped with `((raw - window_lo) % period) + window_lo`; `usage` is
+descriptive metadata. If `period` is omitted, it defaults to 2π.
+`q_ref.json` contains a nonzero quaternion in **XYZW** order, either a JSON array
+or `{"q_ref": [...]}`. State quaternions are sign-aligned to that reference.
+Use the values exported by training. Files are validated before hardware setup.
+Configs with `ROT6D` in their name, plus `THREE_TASKS_ABS_DELTAS_LORA`, require
+the joint branch. Quaternion configs (`ABL7_FULLREL_QUAT`, `ABL6_EEFSRC_FULLSTATE`,
+`THREE_TASKS_2_ABS_DELTAS_LORA`, and `THREE_TASKS_2_FIXED_LORA`) require `q_ref`.
+Rot6D configs do not require `q_ref`. Replay does not require either file.
+
+The former inline joint bounds live in config-specific files:
+
+- `THREE_TASKS_ABS_DELTAS_LORA`: `dataset_meta/three_tasks_abs_deltas_lora/joint_branch.json`
+- `THREE_TASKS_2_FIXED_LORA`: `dataset_meta/three_tasks_2_fixed_lora/joint_branch.json`
+
+These configs load their historical bounds on construction. Live rot6D launches
+still require an explicit `--joint-branch`, which overrides the default. The
+quaternion config still requires only `--q-ref`; optionally supply
+`--joint-branch` to override its historical joint bounds. Wrapping uses the same
+float32 arithmetic as the former inline implementation, including at boundaries.
+The historical quaternion reference for `THREE_TASKS_2_FIXED_LORA` is stored in
+`dataset_meta/three_tasks_2_fixed_lora/q_ref.json` and loaded on construction.
+Live launches still require `--q-ref`, which overrides that historical default.
 
 Aiming for Kinova...
 

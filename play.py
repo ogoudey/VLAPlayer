@@ -5,6 +5,9 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser()
 parser.add_argument("recording_path", nargs="?", help="Rerun recording output")
+parser.add_argument("--config", default="EEF_ROT6D_ABS_IN_OUT", help="GrootConfig enum name for live inference")
+parser.add_argument("--joint-branch", type=Path, default="dataset_meta/three_tasks_tomato_eggplant_pineapple/joint_branch.json",help="Path to joint_branch.json (required for rot6D configs)")
+parser.add_argument("--q-ref", type=Path, help="Path to q_ref.json (required for quaternion configs)")
 parser.add_argument("--twist", action="store_true",
                     help="Execute actions with apply_action instead of waiting for waypoints")
 parser.add_argument("--execution-horizon", type=int, default=8,
@@ -46,7 +49,15 @@ if args.replay_episode is not None:
         print(f"Absolute XYZ targets: {args.replay_targets_csv}; orientation fixed at replay start")
     control_period_s = args.control_period_s or 1.0 / remote.episode["fps"]
 else:
-    remote = GrootN17ServerConfiguration(ip="192.168.0.196", port=5555, config=GrootConfig.EEF_ROT6D_ABS_IN_OUT, timeout_ms=15000)
+    try:
+        config = GrootConfig[args.config]
+    except KeyError:
+        parser.error(f"Unknown config {args.config!r}; choose from {', '.join(GrootConfig.__members__)}")
+    remote = GrootN17ServerConfiguration(ip="192.168.0.196", port=5555, config=config, timeout_ms=15000)
+    try:
+        remote.load_reference_files(joint_branch_path=args.joint_branch, q_ref_path=args.q_ref)
+    except ValueError as exc:
+        parser.error(str(exc))
     control_period_s = args.control_period_s or 0.02
 print(f"Control period dt: {control_period_s:g} s")
 remote.execution_horizon = args.execution_horizon

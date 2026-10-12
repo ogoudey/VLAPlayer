@@ -15,6 +15,8 @@ from scipy.spatial.transform import Rotation
 import subprocess
 import paramiko
 import os
+import json
+from pathlib import Path
 
 from enum import Enum
 
@@ -29,13 +31,41 @@ class GrootConfig(Enum):
     THREE_TASKS_2_FIXED_LORA = "THREE_TASKS_2_FIXED_LORA"
     EEF_ROT6D_ABS_IN_OUT = "EEF_ROT6D_ABS_IN_OUT"
 
+    @property
+    def uses_rot6d(self) -> bool:
+        return "ROT6D" in self.name or self == GrootConfig.THREE_TASKS_ABS_DELTAS_LORA
+
+    @property
+    def uses_quat(self) -> bool:
+        return self in {
+            GrootConfig.ABL7_FULLREL_QUAT,
+            GrootConfig.ABL6_EEFSRC_FULLSTATE,
+            GrootConfig.THREE_TASKS_2_ABS_DELTAS_LORA,
+            GrootConfig.THREE_TASKS_2_FIXED_LORA,
+        }
+
 @dataclass
 class GrootN17ServerConfiguration(ServerConfiguration):
     config: GrootConfig # observation/action layout must match the server checkpoint
     execution_horizon: int = 8
     timeout_ms: int = 15000
+    joint_branch: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+    joint_period: float = 2 * np.pi
+    q_ref: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
 
     _client: Optional[PolicyClient] = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        defaults = {
+            GrootConfig.THREE_TASKS_ABS_DELTAS_LORA: "three_tasks_abs_deltas_lora",
+            GrootConfig.THREE_TASKS_2_FIXED_LORA: "three_tasks_2_fixed_lora",
+        }
+        if self.joint_branch is None and self.config in defaults:
+            path = Path(__file__).resolve().parents[1] / "dataset_meta" / defaults[self.config] / "joint_branch.json"
+            self._load_reference_file(path, joint=True)
+        if self.q_ref is None and self.config == GrootConfig.THREE_TASKS_2_FIXED_LORA:
+            path = Path(__file__).resolve().parents[1] / "dataset_meta" / "three_tasks_2_fixed_lora" / "q_ref.json"
+            self._load_reference_file(path, joint=False)
 
     def _ensure_client(self) -> None:
         if self._client is None:
@@ -99,7 +129,74 @@ class GrootN17ServerConfiguration(ServerConfiguration):
         client.close()
         return exit_status == 0
 
+    def load_reference_files(self, *, joint_branch_path=None, q_ref_path=None):
+        """Load training references for live inference before connecting to hardware.
+
+        Joint branch is seven lower bounds in radians; q_ref is XYZW.
+        Joint objects contain window_lo and period; usage is descriptive metadata.
+        Also accept a JSON array or an object containing joint_window_lo / q_ref.
+        """
+        if not self.config.uses_rot6d and not self.config.uses_quat:
+            return
+        path = joint_branch_path if self.config.uses_rot6d else q_ref_path
+        flag = "--joint-branch" if self.config.uses_rot6d else "--q-ref"
+        if path is None:
+            raise ValueError(f"{self.config.name} requires {flag}")
+        self._load_reference_file(path, joint=self.config.uses_rot6d)
+        if self.config.uses_quat and joint_branch_path is not None:
+            self._load_reference_file(joint_branch_path, joint=True)
+
+    def _load_reference_file(self, path, *, joint: bool):
+        flag = "--joint-branch" if joint else "--q-ref"
+        try:
+            data = json.loads(Path(path).read_text())
+            period = 2 * np.pi
+            if isinstance(data, dict):
+                if joint:
+                    period = float(data.get("period", 2 * np.pi))
+                    if not np.isfinite(period) or period <= 0:
+                        raise ValueError("period must be finite and positive")
+                keys = ("window_lo", "joint_window_lo", "JOINT_WINDOW_LO") if joint else ("q_ref",)
+                data = next((data[key] for key in keys if key in data), None)
+            values = np.asarray(data, dtype=np.float64)
+            size = 7 if joint else 4
+            if values.shape != (size,) or not np.all(np.isfinite(values)):
+                raise ValueError(f"expected {size} finite numeric values")
+            if joint:
+                self.joint_branch = values
+                self.joint_period = period
+            else:
+                norm = np.linalg.norm(values)
+                if norm == 0 or not np.isfinite(norm):
+                    raise ValueError("q_ref must be a nonzero quaternion")
+                self.q_ref = values / norm
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid {flag} file {path}: {exc}") from exc
+
     def _to_gr00t_request(self, observation: Observation):
+        request = self._build_gr00t_request(observation)
+        if self.joint_branch is not None:
+            # Preserve the inline implementation's float32 arithmetic, including
+            # which side of a branch boundary a joint falls on.
+            joints = np.deg2rad(np.asarray(observation.state.joint_angles, dtype=np.float32))
+            lower = self.joint_branch.astype(np.float32)
+            joints = (joints - lower) % self.joint_period + lower
+            request["state"]["arm_joints"] = self._add_batch_and_time_dims(joints.astype(np.float32))
+        if self.q_ref is not None:
+            pose = observation.state.target_pose
+            quat = np.array([pose.theta_x, pose.theta_y, pose.theta_z, pose.theta_w], dtype=np.float32)
+            if quat.dot(self.q_ref) < 0:
+                quat = -quat
+            if "arm_quat" in request["state"]:
+                request["state"]["arm_quat"] = self._add_batch_and_time_dims(quat)
+            else:
+                # Legacy ABS_ROT6D_LORA uses XYZ + WXYZ quaternion state.
+                request["state"]["eef_pose"] = self._add_batch_and_time_dims(
+                    np.array([pose.x, pose.y, pose.z, quat[3], *quat[:3]], dtype=np.float32)
+                )
+        return request
+
+    def _build_gr00t_request(self, observation: Observation):
         views = observation.vision.views
         wrist = views.get("onboard")
         exterior = next((v for camera_id, v in views.items() if camera_id != "onboard"), None)
@@ -271,8 +368,6 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                 pose = observation.state.target_pose
 
                 joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
-                JOINT_WINDOW_LO = np.array([-2.559710208569662, -2.8912901023971003, -6.894980764381135, -5.040146803847993, -3.489536766205923, -3.6565758551107805, -1.1027804930978498], dtype=np.float32)
-                joints = (joints - JOINT_WINDOW_LO) % (2 * np.pi) + JOINT_WINDOW_LO
                 rot6d = self._eef_6d_rot_first_two_rows(pose)
                 position = np.array([pose.x, pose.y, pose.z], dtype=np.float32)
                 pose_9d = np.concatenate([position, rot6d])
@@ -296,26 +391,9 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                 pose = observation.state.target_pose
 
                 joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
-                JOINT_WINDOW_LO = np.array([
-                    -3.023638133202688,
-                    -2.8912901023971003,
-                    -6.3224516868512275,
-                    -5.040146803847993,
-                    -3.2025910357581537,
-                    -3.610507700835363,
-                    -1.4728048165612897
-                ], dtype=np.float32)
-                joints = (joints - JOINT_WINDOW_LO) % (2 * np.pi) + JOINT_WINDOW_LO
 
 
-                q_ref = np.array([
-                    0.7057592503866893,
-                    0.7076099545579241,
-                    0.024808814852628452,
-                    0.024011568248638298
-                ], dtype=np.float32)
                 quat = np.array([pose.theta_x, pose.theta_y, pose.theta_z, pose.theta_w])
-                adjusted_quat = -quat if quat.dot(q_ref) < 0 else quat
                 print(f"[torequest] {observation.language}")
                 return {
                     "video": {
@@ -327,7 +405,7 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                             joints
                         ),
                         "arm_pos": self._add_batch_and_time_dims(np.array([pose.x, pose.y, pose.z], dtype=np.float32)),
-                        "arm_quat": self._add_batch_and_time_dims(np.array(adjusted_quat, dtype=np.float32)),
+                        "arm_quat": self._add_batch_and_time_dims(np.array(quat, dtype=np.float32)),
                         "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
                     },
                     "language": {
