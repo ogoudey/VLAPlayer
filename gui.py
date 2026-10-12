@@ -146,6 +146,19 @@ _PAGE_TEMPLATE = """<!doctype html>
 
     const btnStart = document.getElementById("start-btn");
     const inputPrompt = document.getElementById("prompt");
+    let promptTimer = null;
+
+    inputPrompt.addEventListener("input", () => {{
+    clearTimeout(promptTimer);
+    promptTimer = setTimeout(() => {{
+        fetch("/api/prompt", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ prompt: inputPrompt.value }}),
+        }}).catch(() => {{ /* poll will resync */ }});
+    }}, 300);
+    }});
+    
     const inputGain = document.getElementById("gain");
     inputGain.addEventListener("change", () => {{
         const value = parseFloat(inputGain.value);
@@ -218,7 +231,10 @@ _PAGE_TEMPLATE = """<!doctype html>
         if (document.activeElement !== inputGain) {{
             inputGain.value = s.gain;
         }}
-        
+
+        if (document.activeElement !== inputPrompt && s.language !== undefined) {{
+            inputPrompt.value = s.language;
+        }}
         const dot = document.getElementById("conn-dot");
         const connText = document.getElementById("conn-text");
         dot.className = "dot " + (s.connection.connected ? "on" : "off");
@@ -292,6 +308,7 @@ class GUI(UI):
             "client_latency_ms": None,
             "connection": {"connected": False, "stats": {}},
             "cameras": {},
+            "language": "",
         }
         self._start_lock = threading.Lock()
 
@@ -464,6 +481,20 @@ class GUI(UI):
         if not was_paused:
             self.unpause()
     
+    def set_prompt(self, prompt: str) -> None:
+        prompt = prompt.strip()
+        if not prompt:
+            return  # don't let an empty box blank out the active instruction
+        with self._status_lock:
+            if prompt == self._status["language"]:
+                return  # no-op: don't log duplicates
+            self._status["language"] = prompt
+        self.language = prompt
+        self.client.language = prompt
+        self.report_loop_event(f"Prompt changed: {prompt!r}")  # prints and logs to inference/events
+        if self._display_active:
+            rr.log("/language", rr.TextDocument(prompt))
+
     # ------------------------------------------------------------------ #
     # start / pause / unpause — the Start button becomes a pause toggle
     # once the initial start has happened
@@ -563,6 +594,12 @@ class GUI(UI):
             )
         rr.log("inference/loop_drift_ms", rr.Scalars(drift_ms))
 
+    def report_language(self, prompt: str) -> None:
+        with self._status_lock:
+            self._status["language"] = prompt
+        if not self._display_active or not self._actively_predicting:
+            return
+        rr.log("/language", rr.TextLog(prompt))
 
     def report_client_latency(self, latency_ms: float) -> None:
         with self._status_lock:
@@ -976,9 +1013,16 @@ class GUI(UI):
             with self._status_lock:
                 return JSONResponse(dict(self._status))
 
+        @app.post("/api/prompt")
+        def api_prompt(payload: dict = Body(...)):
+            self.set_prompt(str(payload.get("prompt", "")))
+            return JSONResponse({"prompt": self.client.language})
+
         @app.post("/api/toggle")
         def api_toggle(payload: dict = Body(...)):
-            self.language = payload.get("prompt", "")
+            if "prompt" in payload:
+                self.set_prompt(payload["prompt"])
+            
             self.toggle_start_pause()
             with self._status_lock:
                 return JSONResponse({"started": self._status["started"], "paused": self._status["paused"]})

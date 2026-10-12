@@ -5,10 +5,9 @@ from typing import Optional
 
 
 class UI:
-    STATIC_LANGUAGE: str = "pick up the yellow block"
 
     def __init__(self, headless: bool = True, direct_start: bool = False):
-        self.language = UI.STATIC_LANGUAGE
+        self.language = ""
 
         self._player = None
 

@@ -589,6 +589,7 @@ class GrootN17Client(Client):
 
         while not self._stop_inference.is_set():
             if not self.predicting:
+                action_queue.queue.clear()
                 time_package.sleep(0.05)
                 next_tick = time_package.monotonic()
                 continue
@@ -600,6 +601,7 @@ class GrootN17Client(Client):
                 self.ui.report_loop_event("Action queue empty — requesting prediction")
                 try:
                     predict_start = time_package.monotonic()
+                    self.ui.report_language(self.language)
                     chunk = self.server.make_prediction(observation=self.get_observation())
                     self.ui.report_client_latency((time_package.monotonic() - predict_start) * 1000)
                 except Exception as e:
@@ -621,6 +623,7 @@ class GrootN17Client(Client):
             self.ui.report_applied_action(action)
             try:
                 if not self.predicting:
+                    action_queue.queue.clear()
                     continue
                 self.connection.apply_action(action)
             except Exception as e:

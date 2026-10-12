@@ -182,3 +182,16 @@ class CameraSet:
         self.recording = True
     def stop_recording(self):
         self.recording = False
+
+if __name__ == "__main__":
+
+    ctx = rs.context()
+    for dev in ctx.query_devices():
+        dev.hardware_reset() # THIS WAS NEEDED 10.12.26. Might be needed again...
+
+    devices = rs.context().query_devices()
+    if len(devices) == 0:
+        raise RuntimeError("No RealSense device detected over USB.")
+    # First device found. If you ever have more than one D435, pass its
+    # serial explicitly instead of relying on auto-detect picking one.
+    print(f"Using RealSense device: {devices[0].get_info(rs.camera_info.serial_number)}")
