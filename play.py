@@ -8,8 +8,13 @@ parser.add_argument("recording_path", nargs="?", help="Rerun recording output")
 parser.add_argument("--config", default="EEF_ROT6D_ABS_IN_OUT", help="GrootConfig enum name for live inference")
 parser.add_argument("--joint-branch", type=Path, default="dataset_meta/three_tasks_tomato_eggplant_pineapple/joint_branch.json",help="Path to joint_branch.json (required for rot6D configs)")
 parser.add_argument("--q-ref", type=Path, help="Path to q_ref.json (required for quaternion configs)")
-parser.add_argument("--twist", action="store_true",
-                    help="Execute actions with apply_action instead of waiting for waypoints")
+parser.add_argument("--execution", choices=("tidybot", "waypoint", "delta"),
+                    default="tidybot",
+                    help="Action execution: Tidybot RPC, Kinova waypoints, or apply_action deltas (default: tidybot)")
+parser.add_argument("--tidybot-host", default="localhost", help="Tidybot arm RPC host")
+parser.add_argument("--tidybot-port", type=int, default=50001, help="Tidybot arm RPC port")
+parser.add_argument("--tidybot-robot-ip", default="192.168.1.10",
+                    help="Kinova IP for the wrist camera when using Tidybot")
 parser.add_argument("--execution-horizon", type=int, default=8,
                     help="Maximum actions to execute per prediction chunk (default: 8)")
 parser.add_argument("--replay-episode", nargs="?", type=Path,
@@ -28,6 +33,13 @@ if args.execution_horizon <= 0:
     parser.error("--execution-horizon must be a positive integer")
 if args.replay_targets_csv is not None and args.replay_episode is None:
     args.replay_episode = Path(__file__).parent / "data/replay/eggplant_episode_002/episode.json"
+if args.execution == "tidybot":
+    if args.replay_episode is not None and args.replay_targets_csv is None:
+        parser.error("--execution tidybot replay requires absolute targets via --replay-targets-csv")
+    if args.replay_episode is None and args.config not in {
+        "EEF_ROT6D_ABS_IN_OUT", "THREE_TASKS_REL_ROT6D_LORA",
+    }:
+        parser.error("--execution tidybot requires a config that decodes to absolute PoseTarget actions")
 if args.control_period_s is not None and (
     not math.isfinite(args.control_period_s) or args.control_period_s <= 0
 ):
@@ -61,7 +73,8 @@ else:
     control_period_s = args.control_period_s or 0.02
 print(f"Control period dt: {control_period_s:g} s")
 remote.execution_horizon = args.execution_horizon
-client = GrootN17Client(remote=remote, twist=args.twist)
+client = GrootN17Client(remote=remote, twist=args.execution == "delta",
+                       tidybot=args.execution == "tidybot")
 
 """
 IF the state pose does not follow the target pose, expose the twists.
@@ -78,8 +91,15 @@ uv run python gr00t/eval/run_gr00t_server.py --model-path /home/hrilab/Isaac-GR0
 #client = Pi05Client(remote=Pi05ServerConfiguration(ip="192.168.0.177", port=8000, setting="LIBERO"))
 
 
-from connections.kinova import KinovaConnection
-connection = KinovaConnection(auto_detect=True, control_period_s=control_period_s)
+if args.execution == "tidybot":
+    from clients.tidybot_interface import TidybotInterface
+    connection = TidybotInterface(
+        control_period_s=control_period_s, rpc_host=args.tidybot_host,
+        rpc_port=args.tidybot_port, robot_ip=args.tidybot_robot_ip,
+    )
+else:
+    from connections.kinova import KinovaConnection
+    connection = KinovaConnection(auto_detect=True, control_period_s=control_period_s)
 
 
 from camera_set import CameraConnection, CameraSet
@@ -120,6 +140,7 @@ except KeyboardInterrupt:
     pass
 finally:
     client.stop_predicting()
+    client.stop_inference_loop()
     connection.pause()
     ui.stop()
    

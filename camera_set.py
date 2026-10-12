@@ -34,9 +34,10 @@ class CameraConnection:
 
         elif onboard_connection is not None:
             self.backend = "rtsp"
-            # No duck-typed "onboard_camera" attribute — go straight to the
-            # real, already-known field on KinovaConnection.
-            ip_address = onboard_connection.tcp_connection.ip_address
+            # RPC backends provide the camera address without opening Kortex.
+            ip_address = getattr(onboard_connection, "camera_ip_address", None)
+            if ip_address is None:
+                ip_address = onboard_connection.tcp_connection.ip_address
             self.rtsp_url = f"rtsp://{ip_address}/color"
             self.id = "onboard"
             self._capture: Optional[cv2.VideoCapture] = None

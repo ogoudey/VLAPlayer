@@ -794,9 +794,18 @@ class GrootN17Client(Client):
     """
     Same as PI client actually
     """
-    def __init__(self, remote: Optional[ServerConfiguration]=None, *, twist: bool = False):
+    def __init__(self, remote: Optional[ServerConfiguration]=None, *, twist: bool = False,
+                 tidybot: Optional[bool] = None):
         super().__init__()
+        if tidybot is None:
+            tidybot = not twist
+        if twist and tidybot:
+            raise ValueError("Choose either twist or Tidybot execution")
         self.twist = twist
+        self.tidybot = tidybot
+        self._target_stream = None
+        self._tidybot_loop_lock = threading.Lock()
+        self._stop_inference = threading.Event()
         if remote is None:
             # ignore for now
             pass
@@ -808,6 +817,23 @@ class GrootN17Client(Client):
         return self.server.config
     
     def start_inference_loop(self):
+        if self.tidybot and not isinstance(self.server, RecordedGrootConfiguration):
+            from clients.tidybot_stream import TidybotTargetStream
+
+            if not self._tidybot_loop_lock.acquire(blocking=False):
+                self.ui.report_loop_event("Tidybot target loop is already running")
+                return
+            try:
+                if self._target_stream is not None and self._target_stream.worker_alive:
+                    self.ui.report_loop_event("Previous prediction worker is still finishing", level="warn")
+                    return
+                self._stop_inference = threading.Event()
+                self._target_stream = TidybotTargetStream(self, self._stop_inference)
+                self._target_stream.run()
+            finally:
+                self._tidybot_loop_lock.release()
+            return
+
         self._stop_inference = threading.Event()
         action_queue: "queue.Queue[Action]" = queue.Queue()
         period = self.connection.control_period_s
@@ -847,6 +873,10 @@ class GrootN17Client(Client):
                     action_queue.put(action)
                 self.ui.report_loop_event(f"Received chunk of {len(chunk.actions)} actions")
                 self.ui.report_queue_depth(action_queue.qsize())
+                if self.tidybot:
+                    # Prediction latency must not cause streamed targets to
+                    # catch up to a deadline from before the inference gap.
+                    next_tick = time_package.monotonic()
 
             action = action_queue.get()
             current_period = self.connection.control_period_s
@@ -861,7 +891,9 @@ class GrootN17Client(Client):
                     continue
                 if isinstance(self.server, RecordedGrootConfiguration):
                     self.server.check_action(self.connection, action)
-                if self.twist:
+                if self.tidybot:
+                    self.connection.apply_abs_action_tidybot(action)
+                elif self.twist:
                     self.connection.apply_action(action)
                 else:
                     self.connection.apply_action_waypoint(action)
@@ -870,9 +902,20 @@ class GrootN17Client(Client):
                 self.predicting = False
                 break
             except Exception as e:
-                self.ui.report_loop_event(f"apply_action failed, skipping: {e}", level="warn")
-                if isinstance(self.server, RecordedGrootConfiguration):
+                stopping = self.tidybot or isinstance(self.server, RecordedGrootConfiguration)
+                pausing = self.tidybot and not isinstance(self.server, RecordedGrootConfiguration)
+                self.ui.report_loop_event(
+                    f"apply_action failed, {'pausing' if pausing else 'stopping' if stopping else 'skipping'}: {e}",
+                    level="warn",
+                )
+                if stopping:
                     self.predicting = False
+                    if pausing:
+                        # Keep the live loop available for Pause/Resume, but
+                        # discard the failed chunk and wait for user input.
+                        action_queue.queue.clear()
+                        self.connection.pause()
+                        continue
                     break
             
             tick_start = time_package.monotonic()
@@ -888,10 +931,25 @@ class GrootN17Client(Client):
 
         # Loop is exiting — make sure the arm isn't left coasting on a stale
         # velocity command from the last apply_action().
-        self.connection.handle_cartesian_delta(CartesianDelta())
+        if self.tidybot:
+            self.connection.pause()
+        else:
+            self.connection.handle_cartesian_delta(CartesianDelta())
 
     def stop_inference_loop(self):
         self._stop_inference.set()
+        if self._target_stream is not None:
+            self._target_stream.stop()
+
+    def stop_predicting(self):
+        super().stop_predicting()
+        if self._target_stream is not None:
+            self._target_stream.set_enabled(False)
+
+    def start_predicting(self):
+        super().start_predicting()
+        if self._target_stream is not None:
+            self._target_stream.set_enabled(True)
 
     def get_observation(self):
         observation = Observation(

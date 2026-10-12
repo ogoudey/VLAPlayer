@@ -5,9 +5,66 @@
 python3 play.py --joint-branch /path/to/joint_branch.json
 ```
 
-GR00T actions use `apply_action_waypoint` by default, waiting for each waypoint
-to complete. Run `python3 play.py --twist` to use `apply_action` instead.
-This option also applies to recorded episodes played through `play.py`.
+GR00T actions use `apply_abs_action_tidybot` by default. Run
+`python3 play.py --execution waypoint` to use `apply_action_waypoint`,
+waiting for each waypoint to complete, or `--execution delta` to use `apply_action`.
+These options also apply to recorded episodes played through `play.py`.
+
+To use the same compliant controller as Tidybot teleop, start its arm server
+in one terminal, then run the player in another:
+
+```bash
+cd /home/hri/tidybot2
+python arm_server.py
+```
+
+```bash
+python play.py --config EEF_ROT6D_ABS_IN_OUT \
+  --joint-branch /path/to/joint_branch.json --dt 0.02
+```
+
+`clients/tidybot_interface.py` exposes `TidybotInterface.apply_abs_action_tidybot(PoseTarget)`.
+It sends exact absolute XYZ in metres, XYZW quaternions, and gripper targets in
+`[0, 1]` to `Arm.execute_action`; Tidybot handles IK, trajectory generation, and
+1 kHz current control. Finite gripper predictions outside `[0, 1]` are clamped
+to that range and logged; NaN and infinite predictions are rejected.
+Gain does not scale these absolute targets. An omitted
+gripper command keeps the last gripper target. State comes from the same server,
+with joint radians converted to the player's degree-based state schema.
+Awake resets/retracts the arm and starts its controller. The wrist camera reads
+RTSP directly without opening another Kortex control connection.
+
+`--execution` accepts `tidybot`, `waypoint`, or `delta`, and defaults to `tidybot`.
+Tidybot accepts absolute
+`PoseTarget` outputs (`EEF_ROT6D_ABS_IN_OUT` or `THREE_TASKS_REL_ROT6D_LORA`);
+delta outputs must first be converted to absolute targets. Recorded replay needs
+`--replay-targets-csv`. Use `--tidybot-host` and `--tidybot-port` for a remote arm
+server, and `--tidybot-robot-ip` for a different wrist-camera address.
+Use poses calibrated to Tidybot's tool frame (currently a 0.12 m gripper offset).
+Live Tidybot execution samples measured state and submits a target every `--dt`
+without waiting for the arm to reach it. A separate inference worker requests
+the next chunk before the target queue empties. There is no automatic pause or
+100 ms delay between live chunks. When inference falls behind, the latest target
+is resent on every tick, like enabled teleop with an unchanged target. The arm
+continues tracking that target instead of triggering the command watchdog.
+
+Predictions are aligned to their observation time: elapsed steps are skipped,
+and the remaining fresh targets replace the old plan, up to `--execution-horizon`.
+If inference takes longer than the whole predicted trajectory, the last target
+continues to be sent while a fresh prediction is requested. Matching the target
+rate and controller does not guarantee identical physical lag or hard real-time
+deadlines; model latency, target trajectories, and RPC overruns still matter.
+
+Manual Pause stops all submissions and discards queued targets and predictions
+from before the pause. Resume seeds its initial target from measured state.
+Changing dt also invalidates predictions made at the old rate. The server's
+watchdog starts holding/decelerating after 50 ms without commands at its current
+default policy period. Periods longer than that timeout interrupt trajectories.
+Recorded replay retains chronological playback and its existing chunk pauses;
+it does not skip frames to compensate for prediction latency. RPC or target
+validation errors pause live Tidybot inference and discard the failed chunk.
+Pause/Resume requests a fresh prediction; recorded replay stops on errors.
+
 The `dt (seconds)` field below Gain starts at the launch-time `--dt` value.
 Changing it updates the control period for the next action without restarting.
 An in-progress waypoint or sleep finishes first. Recorded replay still checks
@@ -23,8 +80,8 @@ Re-write `play.py`
 Live inference requires the training reference matching the selected config:
 
 ```bash
-python play.py --config EEF_ROT6D_ABS_IN_OUT --joint-branch /path/to/joint_branch.json --dt 1
-python play.py --config THREE_TASKS_2_FIXED_LORA --q-ref /path/to/q_ref.json
+python play.py --config EEF_ROT6D_ABS_IN_OUT --joint-branch /path/to/joint_branch.json --dt 0.02
+python play.py --execution waypoint --config THREE_TASKS_2_FIXED_LORA --q-ref /path/to/q_ref.json
 ```
 
 `joint_branch.json` contains seven joint window lower bounds in **radians**,
@@ -114,8 +171,9 @@ are `eef_pose_targets` with shape `(1, T, 9)` and `gripper_targets` with shape
 flattened, matching the training conversion. State joints are sent in radians.
 Returned poses are decoded into absolute quaternion `PoseTarget` actions;
 gripper targets are passed through as absolute commands. The inference loop
-executes these poses through `apply_action_waypoint` by default, waiting for each
-waypoint to complete before sending the next. Use `--twist` to use `apply_action`.
+executes these poses through `apply_abs_action_tidybot` by default. Use
+`--execution waypoint` to wait for each Kinova waypoint to complete, or `--execution delta` to use
+`apply_action`.
 
 Select the checkpoint separately using the server's `--model-path`, and use
 the embodiment tag saved in its processor. This client config selects the
@@ -126,7 +184,7 @@ wire layout; it does not select weights or send an embodiment tag.
 To debug the actual queue and timing in `clients/groot.py`, run in `kinova-groot`:
 
 ```bash
-python play.py --replay-episode --min-z "$MIN_TOOL_Z"
+python play.py --execution waypoint --replay-episode --min-z "$MIN_TOOL_Z"
 ```
 
 This defaults to eggplant `episode_index=2`. An explicit JSON path may follow
@@ -152,7 +210,7 @@ loop and sends zero velocity; restart the program to replay again.
 For a simulated 200 ms server response time on each chunk:
 
 ```bash
-python play.py --replay-episode --min-z "$MIN_TOOL_Z" --replay-delay 0.2
+python play.py --execution waypoint --replay-episode --min-z "$MIN_TOOL_Z" --replay-delay 0.2
 ```
 
 With the default delay of zero, there is no server/network latency. This is not
@@ -161,13 +219,13 @@ Like the live loop, pausing clears queued actions, so a mid-chunk pause discards
 the remaining rows of that chunk and resumes at the next chunk. Console messages
 show the loaded frame ranges. Supply the usual positional recording path before
 the flags to save the GUI telemetry, e.g. `python play.py replay.rrd
---replay-episode --min-z "$MIN_TOOL_Z"`. Without `--replay-episode`, normal server
+--execution waypoint --replay-episode --min-z "$MIN_TOOL_Z"`. Without `--replay-episode`, normal server
 inference is selected.
 
 ## Replay absolute CSV positions through the waypoint executor
 
 ```bash
-python play.py absolute_replay.rrd --replay-targets-csv --min-z "$MIN_TOOL_Z" --dt 0.02
+python play.py absolute_replay.rrd --execution waypoint --replay-targets-csv --min-z "$MIN_TOOL_Z" --dt 0.02
 ```
 
 This uses all 421 `target_x_m`, `target_y_m`, and `target_z_m` rows from
