@@ -24,7 +24,7 @@ class FakeClock:
 class GrootReplayTests(unittest.TestCase):
     def make_client(self, **kwargs):
         source = RecordedGrootConfiguration(DEFAULT_EPISODE, min_z=.1, **kwargs)
-        client = GrootN17Client(remote=source)
+        client = GrootN17Client(remote=source, tidybot=False)
         ref = source.episode["frames"][0]["observation.state"]
         import math
         state = State(joint_angles=[math.degrees(q) for q in ref[:7]],

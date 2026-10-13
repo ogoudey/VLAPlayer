@@ -71,7 +71,7 @@ class GrootRot6DTests(unittest.TestCase):
             ]]),
             "gripper_targets": np.array([[[.2], [.7]]]),
         })
-        client = GrootN17Client(remote=self.server)
+        client = GrootN17Client(remote=self.server, tidybot=False)
         client.connection = MagicMock(control_period_s=.02)
         client.ui = MagicMock()
         client.get_observation = MagicMock()
@@ -92,7 +92,7 @@ class GrootRot6DTests(unittest.TestCase):
         client.connection.apply_action.assert_not_called()
         client.connection.handle_cartesian_delta.assert_called_once()
 
-    def test_waypoints_are_default_and_twist_opts_in_for_both_action_layouts(self):
+    def test_explicit_waypoints_and_twist_for_both_action_layouts(self):
         for config in (GrootConfig.THREE_TASKS_2_FIXED_LORA, GrootConfig.EEF_ROT6D_ABS_IN_OUT):
             for twist in (False, True):
                 with self.subTest(config=config, twist=twist):
@@ -102,7 +102,7 @@ class GrootRot6DTests(unittest.TestCase):
                     else:
                         action = PoseTarget(x=.1, y=.2, z=.3, theta_x=0,
                                             theta_y=0, theta_z=0, theta_w=1)
-                    client = GrootN17Client(remote=self.server, twist=twist)
+                    client = GrootN17Client(remote=self.server, twist=twist, tidybot=False)
                     client.connection = MagicMock(control_period_s=.02)
                     client.ui = MagicMock()
                     client.get_observation = MagicMock()
@@ -119,7 +119,7 @@ class GrootRot6DTests(unittest.TestCase):
 
     def test_dt_change_updates_running_loop_on_next_action(self):
         actions = [CartesianDelta(dx=.001), CartesianDelta(dx=.002)]
-        client = GrootN17Client(remote=self.server)
+        client = GrootN17Client(remote=self.server, tidybot=False)
         client.connection = MagicMock(control_period_s=.02)
         client.ui = MagicMock()
         client.get_observation = MagicMock()
@@ -142,7 +142,7 @@ class GrootRot6DTests(unittest.TestCase):
         self.server.execution_horizon = 2
         first = [CartesianDelta(dx=i * .001) for i in range(4)]
         second = [CartesianDelta(dx=.01 + i * .001) for i in range(4)]
-        client = GrootN17Client(remote=self.server)
+        client = GrootN17Client(remote=self.server, tidybot=False)
         client.connection = MagicMock(control_period_s=.02)
         client.ui = MagicMock()
         client.get_observation = MagicMock()

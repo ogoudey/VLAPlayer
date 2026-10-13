@@ -68,6 +68,7 @@ are None or don't implement these; the poller just skips them.
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future
 import math
 import time
 import urllib.parse
@@ -248,12 +249,21 @@ _PAGE_TEMPLATE = """<!doctype html>
         }}
         lastInstanceId = s.instance_id;
         
-        if (s.awake) {{
+        if (s.initializing) {{
+            btnAwake.disabled = true;
+            btnAwake.textContent = "Waking...";
+        }} else if (s.awake) {{
             btnAwake.disabled = true;
             btnAwake.textContent = "Awakened";
+        }} else {{
+            btnAwake.disabled = false;
+            btnAwake.textContent = "Awake";
         }}
 
-        if (!s.started) {{
+        if (s.starting) {{
+            btnStart.textContent = "Starting...";
+            btnStart.disabled = true;
+        }} else if (!s.started) {{
             btnStart.textContent = "Start";
             btnStart.disabled = false;
         }} else if (s.paused) {{
@@ -350,6 +360,8 @@ class GUI(UI):
         self._status: Dict[str, Any] = {
             "instance_id": self._instance_id,
             "awake": False,
+            "initializing": False,
+            "starting": False,
             "started": False,
             "paused": False,
             "going_home": False,
@@ -368,7 +380,7 @@ class GUI(UI):
         self._poll_stop = threading.Event()
 
         self._player: Optional[Any] = None
-        self._awake_fired = False
+        self._awake_future: Optional[Future] = None
         self._start_fired = False
         self._state_series_logged = False
         self._action_series_logged = False
@@ -390,16 +402,14 @@ class GUI(UI):
     # trigger
     # ------------------------------------------------------------------ #
     def start(self) -> None:
-        if not self._awake_fired:
-            self.awake()
+        self.awake()
         with self._start_lock:
-            already = self._status["started"]
-            with self._status_lock:
-                self._status["started"] = True
+            if self._start_fired or self._player is None:
+                return
             self.clear_live_display()
-            if not already and self._display_active:
+            if self._display_active:
                 rr.log("/gui/events", rr.TextLog("Start triggered"))
-        super().start()
+            self._fire_player_start()
 
     def clear_live_display(self) -> None:
         if self._display_active:
@@ -418,9 +428,6 @@ class GUI(UI):
 
     def awake(self) -> None:
         self._fire_awake()
-        with self._status_lock:
-            self._status["awake"] = True
-        rr.log("/gui/events", rr.TextLog("Awake triggered"))
 
     
     def _pose_series_style(self, prefix: str, translation: bool) -> tuple[list[str], list[tuple[int, int, int]]]:
@@ -568,12 +575,33 @@ class GUI(UI):
         self._fire_player_unpause()
  
     def _fire_awake(self) -> None:
-        if self._awake_fired or self._player is None:
-            return
-        awake = getattr(self._player, "awake", None)
-        if callable(awake):
-            self._awake_fired = True
-            threading.Thread(target=awake, daemon=True, name="gui-player-awake").start()
+        with self._start_lock:
+            if self._player is None:
+                return
+            if self._awake_future is not None:
+                if not self._awake_future.done() or self._awake_future.exception() is None:
+                    return
+            awake = getattr(self._player, "awake", None)
+            if not callable(awake):
+                return
+            future = self._awake_future = Future()
+            with self._status_lock:
+                self._status["initializing"] = True
+
+            def initialize():
+                try:
+                    awake()
+                    with self._status_lock:
+                        self._status["awake"] = True
+                        self._status["initializing"] = False
+                    future.set_result(None)
+                except Exception as exc:
+                    with self._status_lock:
+                        self._status["initializing"] = False
+                    future.set_exception(exc)
+                    self.report_loop_event(f"Initialization failed: {exc}", level="warn")
+
+            threading.Thread(target=initialize, daemon=True, name="gui-player-awake").start()
 
     def _fire_player_start(self) -> None:
         if self._start_fired or self._player is None:
@@ -581,7 +609,33 @@ class GUI(UI):
         start = getattr(self._player, "start", None)
         if callable(start):
             self._start_fired = True
-            threading.Thread(target=start, daemon=True, name="gui-player-start").start()
+            with self._status_lock:
+                self._status["starting"] = True
+            awake_future = self._awake_future
+
+            def run_player():
+                try:
+                    # Player.awake() binds the client only after every camera
+                    # is ready. Start must wait for that whole operation.
+                    if awake_future is None:
+                        raise RuntimeError("Player initialization has not started")
+                    awake_future.result()
+                    with self._status_lock:
+                        self._status["starting"] = False
+                        self._status["started"] = True
+                    self._start_event.set()
+                    start()
+                except Exception as exc:
+                    with self._start_lock:
+                        self._start_fired = False
+                        with self._status_lock:
+                            self._status["starting"] = False
+                            self._status["started"] = False
+                            self._status["paused"] = False
+                        self._start_event.clear()
+                    self.report_loop_event(f"Player start failed: {exc}", level="warn")
+
+            threading.Thread(target=run_player, daemon=True, name="gui-player-start").start()
 
     def _fire_player_pause(self) -> None:
         if self._player is None:

@@ -10,6 +10,10 @@ GR00T actions use `apply_abs_action_tidybot` by default. Run
 waiting for each waypoint to complete, or `--execution delta` to use `apply_action`.
 These options also apply to recorded episodes played through `play.py`.
 
+Start waits for the connection, client, and all cameras to finish waking before
+launching inference. The page shows `Starting...` while it waits. The player
+stays running, including while paused, until you stop it with Ctrl+C.
+
 To use the same compliant controller as Tidybot teleop, start its arm server
 in one terminal, then run the player in another:
 

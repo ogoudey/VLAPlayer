@@ -125,17 +125,12 @@ player = Player(client, connection, camera_set, ui)
 ui.bind_player(player)
 
 print("Open http://127.0.0.1:8000/ and press Start.")
-ui.wait_for_start()  # optional — only if this thread wants to block too
-
-# Keep the process (and telemetry) alive for a bit so you can watch it.
+# Keep the player alive until explicitly stopped, including while paused.
 import time
 try:
-    if args.replay_episode is not None:
-        # Waiting for individual waypoints can take longer than 120 seconds.
-        while True:
-            time.sleep(0.2)
-    else:
-        time.sleep(120)
+    ui.wait_for_start()
+    while True:
+        time.sleep(0.2)
 except KeyboardInterrupt:
     pass
 finally:
