@@ -15,6 +15,8 @@ from scipy.spatial.transform import Rotation
 import subprocess
 import paramiko
 import os
+import json
+from pathlib import Path
 
 from enum import Enum
 
@@ -27,14 +29,43 @@ class GrootConfig(Enum):
     THREE_TASKS_ABS_DELTAS_LORA = "THREE_TASKS_ABS_DELTAS_LORA"
     THREE_TASKS_2_ABS_DELTAS_LORA = "THREE_TASKS_2_ABS_DELTAS_LORA"
     THREE_TASKS_2_FIXED_LORA = "THREE_TASKS_2_FIXED_LORA"
+    EEF_ROT6D_ABS_IN_OUT = "EEF_ROT6D_ABS_IN_OUT"
+
+    @property
+    def uses_rot6d(self) -> bool:
+        return "ROT6D" in self.name or self == GrootConfig.THREE_TASKS_ABS_DELTAS_LORA
+
+    @property
+    def uses_quat(self) -> bool:
+        return self in {
+            GrootConfig.ABL7_FULLREL_QUAT,
+            GrootConfig.ABL6_EEFSRC_FULLSTATE,
+            GrootConfig.THREE_TASKS_2_ABS_DELTAS_LORA,
+            GrootConfig.THREE_TASKS_2_FIXED_LORA,
+        }
 
 @dataclass
 class GrootN17ServerConfiguration(ServerConfiguration):
-    config: GrootConfig # must match --embodiment-tag on the server
-    EXECUTION_HORIZON = 8 # This should be editable in the GUI
+    config: GrootConfig # observation/action layout must match the server checkpoint
+    execution_horizon: int = 8
     timeout_ms: int = 15000
+    joint_branch: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+    joint_period: float = 2 * np.pi
+    q_ref: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
 
     _client: Optional[PolicyClient] = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        defaults = {
+            GrootConfig.THREE_TASKS_ABS_DELTAS_LORA: "three_tasks_abs_deltas_lora",
+            GrootConfig.THREE_TASKS_2_FIXED_LORA: "three_tasks_2_fixed_lora",
+        }
+        if self.joint_branch is None and self.config in defaults:
+            path = Path(__file__).resolve().parents[1] / "dataset_meta" / defaults[self.config] / "joint_branch.json"
+            self._load_reference_file(path, joint=True)
+        if self.q_ref is None and self.config == GrootConfig.THREE_TASKS_2_FIXED_LORA:
+            path = Path(__file__).resolve().parents[1] / "dataset_meta" / "three_tasks_2_fixed_lora" / "q_ref.json"
+            self._load_reference_file(path, joint=False)
 
     def _ensure_client(self) -> None:
         if self._client is None:
@@ -98,7 +129,74 @@ class GrootN17ServerConfiguration(ServerConfiguration):
         client.close()
         return exit_status == 0
 
+    def load_reference_files(self, *, joint_branch_path=None, q_ref_path=None):
+        """Load training references for live inference before connecting to hardware.
+
+        Joint branch is seven lower bounds in radians; q_ref is XYZW.
+        Joint objects contain window_lo and period; usage is descriptive metadata.
+        Also accept a JSON array or an object containing joint_window_lo / q_ref.
+        """
+        if not self.config.uses_rot6d and not self.config.uses_quat:
+            return
+        path = joint_branch_path if self.config.uses_rot6d else q_ref_path
+        flag = "--joint-branch" if self.config.uses_rot6d else "--q-ref"
+        if path is None:
+            raise ValueError(f"{self.config.name} requires {flag}")
+        self._load_reference_file(path, joint=self.config.uses_rot6d)
+        if self.config.uses_quat and joint_branch_path is not None:
+            self._load_reference_file(joint_branch_path, joint=True)
+
+    def _load_reference_file(self, path, *, joint: bool):
+        flag = "--joint-branch" if joint else "--q-ref"
+        try:
+            data = json.loads(Path(path).read_text())
+            period = 2 * np.pi
+            if isinstance(data, dict):
+                if joint:
+                    period = float(data.get("period", 2 * np.pi))
+                    if not np.isfinite(period) or period <= 0:
+                        raise ValueError("period must be finite and positive")
+                keys = ("window_lo", "joint_window_lo", "JOINT_WINDOW_LO") if joint else ("q_ref",)
+                data = next((data[key] for key in keys if key in data), None)
+            values = np.asarray(data, dtype=np.float64)
+            size = 7 if joint else 4
+            if values.shape != (size,) or not np.all(np.isfinite(values)):
+                raise ValueError(f"expected {size} finite numeric values")
+            if joint:
+                self.joint_branch = values
+                self.joint_period = period
+            else:
+                norm = np.linalg.norm(values)
+                if norm == 0 or not np.isfinite(norm):
+                    raise ValueError("q_ref must be a nonzero quaternion")
+                self.q_ref = values / norm
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid {flag} file {path}: {exc}") from exc
+
     def _to_gr00t_request(self, observation: Observation):
+        request = self._build_gr00t_request(observation)
+        if self.joint_branch is not None:
+            # Preserve the inline implementation's float32 arithmetic, including
+            # which side of a branch boundary a joint falls on.
+            joints = np.deg2rad(np.asarray(observation.state.joint_angles, dtype=np.float32))
+            lower = self.joint_branch.astype(np.float32)
+            joints = (joints - lower) % self.joint_period + lower
+            request["state"]["arm_joints"] = self._add_batch_and_time_dims(joints.astype(np.float32))
+        if self.q_ref is not None:
+            pose = observation.state.target_pose
+            quat = np.array([pose.theta_x, pose.theta_y, pose.theta_z, pose.theta_w], dtype=np.float32)
+            if quat.dot(self.q_ref) < 0:
+                quat = -quat
+            if "arm_quat" in request["state"]:
+                request["state"]["arm_quat"] = self._add_batch_and_time_dims(quat)
+            else:
+                # Legacy ABS_ROT6D_LORA uses XYZ + WXYZ quaternion state.
+                request["state"]["eef_pose"] = self._add_batch_and_time_dims(
+                    np.array([pose.x, pose.y, pose.z, quat[3], *quat[:3]], dtype=np.float32)
+                )
+        return request
+
+    def _build_gr00t_request(self, observation: Observation):
         views = observation.vision.views
         wrist = views.get("onboard")
         exterior = next((v for camera_id, v in views.items() if camera_id != "onboard"), None)
@@ -196,6 +294,28 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                         "sub_task": [[observation.language]],
                     },
                 }
+            case GrootConfig.EEF_ROT6D_ABS_IN_OUT:
+                pose = observation.state.target_pose
+                eef_pose = np.concatenate([
+                    np.array([pose.x, pose.y, pose.z], dtype=np.float32),
+                    self._eef_6d_rot_first_two_rows(pose),
+                ])
+                return {
+                    "video": {
+                        "third_person": self._add_batch_dim(np.stack(exterior.images)),
+                        "wrist": self._add_batch_dim(np.stack(wrist.images)),
+                    },
+                    "state": {
+                        "arm_joints": self._add_batch_and_time_dims(
+                            np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
+                        ),
+                        "eef_pose": self._add_batch_and_time_dims(eef_pose),
+                        "gripper": self._add_batch_and_time_dims(
+                            np.array([observation.state.gripper], dtype=np.float32)
+                        ),
+                    },
+                    "language": {"sub_task": [[observation.language]]},
+                }
             case GrootConfig.THREE_TASKS_REL_ROT6D_LORA:
                 joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
 
@@ -248,8 +368,6 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                 pose = observation.state.target_pose
 
                 joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
-                JOINT_WINDOW_LO = np.array([-2.559710208569662, -2.8912901023971003, -6.894980764381135, -5.040146803847993, -3.489536766205923, -3.6565758551107805, -1.1027804930978498], dtype=np.float32)
-                joints = (joints - JOINT_WINDOW_LO) % (2 * np.pi) + JOINT_WINDOW_LO
                 rot6d = self._eef_6d_rot_first_two_rows(pose)
                 position = np.array([pose.x, pose.y, pose.z], dtype=np.float32)
                 pose_9d = np.concatenate([position, rot6d])
@@ -273,26 +391,9 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                 pose = observation.state.target_pose
 
                 joints = np.deg2rad(np.array(observation.state.joint_angles, dtype=np.float32))
-                JOINT_WINDOW_LO = np.array([
-                    -3.023638133202688,
-                    -2.8912901023971003,
-                    -6.3224516868512275,
-                    -5.040146803847993,
-                    -3.2025910357581537,
-                    -3.610507700835363,
-                    -1.4728048165612897
-                ], dtype=np.float32)
-                joints = (joints - JOINT_WINDOW_LO) % (2 * np.pi) + JOINT_WINDOW_LO
 
 
-                q_ref = np.array([
-                    0.7057592503866893,
-                    0.7076099545579241,
-                    0.024808814852628452,
-                    0.024011568248638298
-                ], dtype=np.float32)
                 quat = np.array([pose.theta_x, pose.theta_y, pose.theta_z, pose.theta_w])
-                adjusted_quat = -quat if quat.dot(q_ref) < 0 else quat
                 print(f"[torequest] {observation.language}")
                 return {
                     "video": {
@@ -304,7 +405,7 @@ class GrootN17ServerConfiguration(ServerConfiguration):
                             joints
                         ),
                         "arm_pos": self._add_batch_and_time_dims(np.array([pose.x, pose.y, pose.z], dtype=np.float32)),
-                        "arm_quat": self._add_batch_and_time_dims(np.array(adjusted_quat, dtype=np.float32)),
+                        "arm_quat": self._add_batch_and_time_dims(np.array(quat, dtype=np.float32)),
                         "gripper": self._add_batch_and_time_dims(np.array([observation.state.gripper], dtype=np.float32)),
                     },
                     "language": {
@@ -347,6 +448,20 @@ class GrootN17ServerConfiguration(ServerConfiguration):
 
     def _from_gr00t_response(self, response: dict, observation: Optional[Observation] = None) -> ActionChunk:
         match self.config:
+            case GrootConfig.EEF_ROT6D_ABS_IN_OUT:
+                poses = np.asarray(response["eef_pose_targets"])[0]  # (T, 9), absolute XYZ + row rot6D
+                grippers = np.asarray(response["gripper_targets"])[0]  # (T, 1)
+                actions = []
+                for pose, gripper in zip(poses, grippers):
+                    eef = EndEffectorPose.from_action_format(pose, ActionFormat.XYZ_ROT6D)
+                    quat = eef.to_rotation("quat", "xyzw")
+                    actions.append(PoseTarget(
+                        x=float(pose[0]), y=float(pose[1]), z=float(pose[2]),
+                        theta_x=float(quat[0]), theta_y=float(quat[1]),
+                        theta_z=float(quat[2]), theta_w=float(quat[3]),
+                        gripper_command=float(gripper[0]),
+                    ))
+                return ActionChunk(actions=actions)
             case GrootConfig.THREE_TASKS_2_ABS_DELTAS_LORA | GrootConfig.THREE_TASKS_2_FIXED_LORA:
                 delta_pos = np.asarray(response["pos_delta"])[0]
                 #delta_rot = np.asarray(response["rot_delta"])[0]
@@ -564,12 +679,133 @@ class GrootN17ServerConfiguration(ServerConfiguration):
             gripper_command=gripper_command,
         )
 
+class RecordedReplayStopped(Exception):
+    """A recorded episode finished, or its replay checks stopped execution."""
+
+
+class RecordedGrootConfiguration(GrootN17ServerConfiguration):
+    """Supply consecutive dataset rows at the normal prediction boundary."""
+
+    def __init__(
+        self, episode_path, *, min_z: float, response_delay_s: float = 0.0,
+        allow_control_period_override: bool = False,
+        absolute_targets_csv=None,
+    ):
+        from replay_episode import load_episode
+
+        super().__init__(ip="recorded", port=0, config=GrootConfig.THREE_TASKS_2_FIXED_LORA)
+        if not np.isfinite(min_z):
+            raise ValueError("Replay min_z must be finite")
+        if not np.isfinite(response_delay_s) or response_delay_s < 0:
+            raise ValueError("Replay response delay must be finite and nonnegative")
+        self.episode = load_episode(episode_path)
+        self.min_z = min_z
+        self.response_delay_s = response_delay_s
+        self.allow_control_period_override = allow_control_period_override
+        self.cursor = 0
+        self._start_checked = False
+        self.absolute_targets = None
+        self._fixed_orientation = None
+        if absolute_targets_csv is not None:
+            import csv
+            from pathlib import Path
+
+            with Path(absolute_targets_csv).open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            if len(rows) != len(self.episode["frames"]):
+                raise ValueError("Absolute target CSV must contain one row per episode frame")
+            self.absolute_targets = []
+            for i, row in enumerate(rows):
+                xyz = [float(row[f"target_{axis}_m"]) for axis in "xyz"]
+                if int(row["frame_index"]) != i or not np.all(np.isfinite(xyz)):
+                    raise ValueError(f"Invalid absolute target CSV frame {i}")
+                self.absolute_targets.append(xyz)
+
+    def ping(self) -> bool:
+        return True
+
+    def test_health(self, timeout: float = 3.0) -> bool:
+        return True
+
+    def start_server(self):
+        return True
+
+    def make_prediction(self, observation: Observation) -> ActionChunk:
+        frames = self.episode["frames"]
+        if self.cursor >= len(frames):
+            raise RecordedReplayStopped(f"Recorded episode complete ({len(frames)} frames)")
+        if self.response_delay_s:
+            time_package.sleep(self.response_delay_s)
+        end = min(self.cursor + self.execution_horizon, len(frames))
+        if self.absolute_targets is not None:
+            if self._fixed_orientation is None:
+                pose = observation.state.target_pose
+                self._fixed_orientation = {
+                    key: getattr(pose, key)
+                    for key in ("theta_x", "theta_y", "theta_z", "theta_w")
+                }
+            chunk = ActionChunk(actions=[
+                PoseTarget(
+                    x=self.absolute_targets[i][0], y=self.absolute_targets[i][1],
+                    z=self.absolute_targets[i][2], **self._fixed_orientation,
+                    gripper_command=frames[i]["action"][6],
+                ) for i in range(self.cursor, end)
+            ])
+        else:
+            values = np.asarray([f["action"] for f in frames[self.cursor:end]], dtype=np.float64)
+            # Feed the same raw response fields through the production decoder.
+            response = {"pos_delta": values[None, :, :3],
+                        "rot_delta": values[None, :, 3:6],
+                        "gripper": values[None, :, 6:7]}
+            chunk = self._from_gr00t_response(response, observation=observation)
+        print(f"[recorded] episode={self.episode['episode_index']} frames={self.cursor}:{end}")
+        self.cursor = end
+        return chunk
+
+    def check_action(self, connection, action):
+        dt = connection.control_period_s
+        if not self.allow_control_period_override and not np.isclose(dt, 1 / self.episode["fps"]):
+            raise RecordedReplayStopped("Replay control period does not match dataset fps")
+        state = connection.state()
+        if not self._start_checked:
+            expected = np.degrees(self.episode["frames"][0]["observation.state"][:7])
+            measured = np.asarray(state.joint_angles)
+            if measured.shape != (7,) or not np.all(np.isfinite(measured)):
+                raise RecordedReplayStopped("Replay requires valid joint feedback")
+            error = np.abs((measured - expected + 180) % 360 - 180)
+            if np.max(error) > 5:
+                raise RecordedReplayStopped(f"Replay start joints differ by {np.max(error):.1f} degrees")
+            self._start_checked = True
+        z = state.target_pose.z
+        if isinstance(action, PoseTarget):
+            next_z = action.z
+        else:
+            gain = connection.ui.gain if connection.ui is not None else 1.0
+            vz = np.clip(gain * action.dz / dt,
+                         -connection.max_linear_velocity, connection.max_linear_velocity)
+            next_z = z + vz * dt
+        if not np.isfinite(z) or not np.isfinite(next_z) or min(z, next_z) <= self.min_z:
+            raise RecordedReplayStopped(
+                f"Replay stopped at tool Z={z:.4f} m, target Z={next_z:.4f} m (min-z={self.min_z})"
+            )
+
+
 class GrootN17Client(Client):
     """
     Same as PI client actually
     """
-    def __init__(self, remote: Optional[ServerConfiguration]=None):
+    def __init__(self, remote: Optional[ServerConfiguration]=None, *, twist: bool = False,
+                 tidybot: Optional[bool] = None):
         super().__init__()
+        if tidybot is None:
+            tidybot = not twist
+        if twist and tidybot:
+            raise ValueError("Choose either twist or Tidybot execution")
+        self.twist = twist
+        self.tidybot = tidybot
+        self._target_stream = None
+        self._tidybot_loop_lock = threading.Lock()
+        self._stop_inference = threading.Event()
         if remote is None:
             # ignore for now
             pass
@@ -581,6 +817,23 @@ class GrootN17Client(Client):
         return self.server.config
     
     def start_inference_loop(self):
+        if self.tidybot and not isinstance(self.server, RecordedGrootConfiguration):
+            from clients.tidybot_stream import TidybotTargetStream
+
+            if not self._tidybot_loop_lock.acquire(blocking=False):
+                self.ui.report_loop_event("Tidybot target loop is already running")
+                return
+            try:
+                if self._target_stream is not None and self._target_stream.worker_alive:
+                    self.ui.report_loop_event("Previous prediction worker is still finishing", level="warn")
+                    return
+                self._stop_inference = threading.Event()
+                self._target_stream = TidybotTargetStream(self, self._stop_inference)
+                self._target_stream.run()
+            finally:
+                self._tidybot_loop_lock.release()
+            return
+
         self._stop_inference = threading.Event()
         action_queue: "queue.Queue[Action]" = queue.Queue()
         period = self.connection.control_period_s
@@ -604,6 +857,10 @@ class GrootN17Client(Client):
                     self.ui.report_language(self.language)
                     chunk = self.server.make_prediction(observation=self.get_observation())
                     self.ui.report_client_latency((time_package.monotonic() - predict_start) * 1000)
+                except RecordedReplayStopped as e:
+                    self.ui.report_loop_event(str(e))
+                    self.predicting = False
+                    break
                 except Exception as e:
                     self.ui.report_loop_event(f"Prediction request failed, retrying: {e}", level="warn")
                     time_package.sleep(0.5)
@@ -613,21 +870,54 @@ class GrootN17Client(Client):
                     time_package.sleep(0.5)
                     continue
                 action_queue.queue.clear()  # clear any stale actions from the queue
-                for action in chunk.actions[:GrootN17ServerConfiguration.EXECUTION_HORIZON]:
+                for action in chunk.actions[:self.server.execution_horizon]:
                     action_queue.put(action)
                 self.ui.report_loop_event(f"Received chunk of {len(chunk.actions)} actions")
                 self.ui.report_queue_depth(action_queue.qsize())
+                if self.tidybot:
+                    # Prediction latency must not cause streamed targets to
+                    # catch up to a deadline from before the inference gap.
+                    next_tick = time_package.monotonic()
 
             action = action_queue.get()
+            current_period = self.connection.control_period_s
+            if current_period != period:
+                period = current_period
+                next_tick = time_package.monotonic()
             self.ui.report_queue_depth(action_queue.qsize())
             self.ui.report_applied_action(action)
             try:
                 if not self.predicting:
                     action_queue.queue.clear()
                     continue
-                self.connection.apply_action(action)
+                if isinstance(self.server, RecordedGrootConfiguration):
+                    self.server.check_action(self.connection, action)
+                if self.tidybot:
+                    self.connection.apply_abs_action_tidybot(action)
+                elif self.twist:
+                    self.connection.apply_action(action)
+                else:
+                    self.connection.apply_action_waypoint(action)
+            except RecordedReplayStopped as e:
+                self.ui.report_loop_event(str(e), level="warn")
+                self.predicting = False
+                break
             except Exception as e:
-                self.ui.report_loop_event(f"apply_action failed, skipping: {e}", level="warn")
+                stopping = self.tidybot or isinstance(self.server, RecordedGrootConfiguration)
+                pausing = self.tidybot and not isinstance(self.server, RecordedGrootConfiguration)
+                self.ui.report_loop_event(
+                    f"apply_action failed, {'pausing' if pausing else 'stopping' if stopping else 'skipping'}: {e}",
+                    level="warn",
+                )
+                if stopping:
+                    self.predicting = False
+                    if pausing:
+                        # Keep the live loop available for Pause/Resume, but
+                        # discard the failed chunk and wait for user input.
+                        action_queue.queue.clear()
+                        self.connection.pause()
+                        continue
+                    break
             
             tick_start = time_package.monotonic()
             next_tick += period
@@ -642,10 +932,25 @@ class GrootN17Client(Client):
 
         # Loop is exiting — make sure the arm isn't left coasting on a stale
         # velocity command from the last apply_action().
-        self.connection.handle_cartesian_delta(CartesianDelta())
+        if self.tidybot:
+            self.connection.pause()
+        else:
+            self.connection.handle_cartesian_delta(CartesianDelta())
 
     def stop_inference_loop(self):
         self._stop_inference.set()
+        if self._target_stream is not None:
+            self._target_stream.stop()
+
+    def stop_predicting(self):
+        super().stop_predicting()
+        if self._target_stream is not None:
+            self._target_stream.set_enabled(False)
+
+    def start_predicting(self):
+        super().start_predicting()
+        if self._target_stream is not None:
+            self._target_stream.set_enabled(True)
 
     def get_observation(self):
         observation = Observation(

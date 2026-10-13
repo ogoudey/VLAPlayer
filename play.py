@@ -1,11 +1,80 @@
 
-import sys
+import argparse
+import math
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("recording_path", nargs="?", help="Rerun recording output")
+parser.add_argument("--config", default="EEF_ROT6D_ABS_IN_OUT", help="GrootConfig enum name for live inference")
+parser.add_argument("--joint-branch", type=Path, default="dataset_meta/three_tasks_tomato_eggplant_pineapple/joint_branch.json",help="Path to joint_branch.json (required for rot6D configs)")
+parser.add_argument("--q-ref", type=Path, help="Path to q_ref.json (required for quaternion configs)")
+parser.add_argument("--execution", choices=("tidybot", "waypoint", "delta"),
+                    default="tidybot",
+                    help="Action execution: Tidybot RPC, Kinova waypoints, or apply_action deltas (default: tidybot)")
+parser.add_argument("--tidybot-host", default="localhost", help="Tidybot arm RPC host")
+parser.add_argument("--tidybot-port", type=int, default=50001, help="Tidybot arm RPC port")
+parser.add_argument("--tidybot-robot-ip", default="192.168.1.10",
+                    help="Kinova IP for the wrist camera when using Tidybot")
+parser.add_argument("--execution-horizon", type=int, default=8,
+                    help="Maximum actions to execute per prediction chunk (default: 8)")
+parser.add_argument("--replay-episode", nargs="?", type=Path,
+                    const=Path(__file__).parent / "data/replay/eggplant_episode_002/episode.json",
+                    help="Feed recorded actions into the GR00T loop (default: eggplant episode 2)")
+parser.add_argument("--min-z", type=float, help="Minimum Kortex tool Z in metres for replay")
+parser.add_argument("--replay-targets-csv", nargs="?", type=Path,
+                    const=Path(__file__).parent / "data/replay/eggplant_episode_002/intended_absolute_positions.csv",
+                    help="Replay exact absolute XYZ targets from CSV with a fixed starting orientation")
+parser.add_argument("--replay-delay", type=float, default=0.0,
+                    help="Simulated server latency in seconds per recorded chunk")
+parser.add_argument("--dt", "--control-period", dest="control_period_s", type=float, default=0.02,
+                    help="Action/control period in seconds (default: dataset period for replay, 0.02 otherwise)")
+args = parser.parse_args()
+if args.execution_horizon <= 0:
+    parser.error("--execution-horizon must be a positive integer")
+if args.replay_targets_csv is not None and args.replay_episode is None:
+    args.replay_episode = Path(__file__).parent / "data/replay/eggplant_episode_002/episode.json"
+if args.execution == "tidybot":
+    if args.replay_episode is not None and args.replay_targets_csv is None:
+        parser.error("--execution tidybot replay requires absolute targets via --replay-targets-csv")
+    if args.replay_episode is None and args.config not in {
+        "EEF_ROT6D_ABS_IN_OUT", "THREE_TASKS_REL_ROT6D_LORA",
+    }:
+        parser.error("--execution tidybot requires a config that decodes to absolute PoseTarget actions")
+if args.control_period_s is not None and (
+    not math.isfinite(args.control_period_s) or args.control_period_s <= 0
+):
+    parser.error("--dt must be a finite positive number of seconds")
+if args.replay_episode is not None and args.min_z is None:
+    parser.error("--replay-episode requires --min-z in Kortex tool coordinates")
 
 # ------- GROOT_CONFIGS ------- #
 from clients.groot import GrootConfig
 
-from clients.groot import GrootN17Client, GrootN17ServerConfiguration
-client = GrootN17Client(remote=GrootN17ServerConfiguration(ip="192.168.0.196", port=5555, config=GrootConfig.THREE_TASKS_2_FIXED_LORA, timeout_ms=15000))
+from clients.groot import GrootN17Client, GrootN17ServerConfiguration, RecordedGrootConfiguration
+if args.replay_episode is not None:
+    remote = RecordedGrootConfiguration(args.replay_episode, min_z=args.min_z,
+                                         response_delay_s=args.replay_delay,
+                                         allow_control_period_override=args.control_period_s is not None,
+                                         absolute_targets_csv=args.replay_targets_csv)
+    print(f"GR00T loop replay: episode {remote.episode['episode_index']}, {remote.episode['task']}")
+    if args.replay_targets_csv is not None:
+        print(f"Absolute XYZ targets: {args.replay_targets_csv}; orientation fixed at replay start")
+    control_period_s = args.control_period_s or 1.0 / remote.episode["fps"]
+else:
+    try:
+        config = GrootConfig[args.config]
+    except KeyError:
+        parser.error(f"Unknown config {args.config!r}; choose from {', '.join(GrootConfig.__members__)}")
+    remote = GrootN17ServerConfiguration(ip="192.168.0.196", port=5555, config=config, timeout_ms=15000)
+    try:
+        remote.load_reference_files(joint_branch_path=args.joint_branch, q_ref_path=args.q_ref)
+    except ValueError as exc:
+        parser.error(str(exc))
+    control_period_s = args.control_period_s or 0.02
+print(f"Control period dt: {control_period_s:g} s")
+remote.execution_horizon = args.execution_horizon
+client = GrootN17Client(remote=remote, twist=args.execution == "delta",
+                       tidybot=args.execution == "tidybot")
 
 """
 IF the state pose does not follow the target pose, expose the twists.
@@ -13,7 +82,7 @@ IF the state pose does not follow the target pose, expose the twists.
 
 """
 Server:
-uv run python gr00t/eval/run_gr00t_server.py --model-path /home/hrilab/Isaac-GR00T/Models/gr00t_tabletop_3tasks_rot6d_LoRA  --embodiment-tag NEW_EMBODIMENT --device cuda:0
+uv run python gr00t/eval/run_gr00t_server.py --model-path /home/hrilab/Isaac-GR00T/Models/gr00t_3tasks_abs_rot6d_lora  --embodiment-tag NEW_EMBODIMENT --device cuda:0
 """
 
 
@@ -22,8 +91,15 @@ uv run python gr00t/eval/run_gr00t_server.py --model-path /home/hrilab/Isaac-GR0
 #client = Pi05Client(remote=Pi05ServerConfiguration(ip="192.168.0.177", port=8000, setting="LIBERO"))
 
 
-from connections.kinova import KinovaConnection
-connection = KinovaConnection(auto_detect=True)
+if args.execution == "tidybot":
+    from clients.tidybot_interface import TidybotInterface
+    connection = TidybotInterface(
+        control_period_s=control_period_s, rpc_host=args.tidybot_host,
+        rpc_port=args.tidybot_port, robot_ip=args.tidybot_robot_ip,
+    )
+else:
+    from connections.kinova import KinovaConnection
+    connection = KinovaConnection(auto_detect=True, control_period_s=control_period_s)
 
 
 from camera_set import CameraConnection, CameraSet
@@ -41,7 +117,7 @@ camera_set = CameraSet([
 
 
 from gui import GUI
-ui = GUI(headless=False, client_setting=client.setting, recording_path=sys.argv[1] if len(sys.argv) > 1 else None)
+ui = GUI(headless=False, client_setting=client.setting, recording_path=args.recording_path)
 
 from player import Player
 player = Player(client, connection, camera_set, ui)
@@ -49,15 +125,17 @@ player = Player(client, connection, camera_set, ui)
 ui.bind_player(player)
 
 print("Open http://127.0.0.1:8000/ and press Start.")
-ui.wait_for_start()  # optional — only if this thread wants to block too
-
-# Keep the process (and telemetry) alive for a bit so you can watch it.
+# Keep the player alive until explicitly stopped, including while paused.
 import time
 try:
-    time.sleep(120)
+    ui.wait_for_start()
+    while True:
+        time.sleep(0.2)
 except KeyboardInterrupt:
     pass
 finally:
+    client.stop_predicting()
+    client.stop_inference_loop()
+    connection.pause()
     ui.stop()
    
-

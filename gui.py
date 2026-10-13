@@ -68,6 +68,8 @@ are None or don't implement these; the poller just skips them.
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future
+import math
 import time
 import urllib.parse
 from typing import Any, Dict, Optional
@@ -128,6 +130,16 @@ _PAGE_TEMPLATE = """<!doctype html>
                 style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35;
                         background: #1a1d24; color: #fff; box-sizing: border-box; width: 100%; margin-top: 4px;" />
         </label>
+      <label style="font-size: 13px; color: #c4c9d4;">dt (seconds)
+        <input type="number" id="dt" step="0.01" min="0.001" disabled
+                style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35;
+                        background: #1a1d24; color: #fff; box-sizing: border-box; width: 100%; margin-top: 4px;" />
+      </label>
+      <label style="font-size: 13px; color: #c4c9d4;">execution horizon (actions)
+        <input type="number" id="execution-horizon" step="1" min="1" disabled
+                style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35;
+                        background: #1a1d24; color: #fff; box-sizing: border-box; width: 100%; margin-top: 4px;" />
+      </label>
       <button id="start-btn">Start</button>
 
       <button id="gohome-btn" style="display:none; background:#6b5ce6;">Go To Home</button>
@@ -160,6 +172,52 @@ _PAGE_TEMPLATE = """<!doctype html>
     }});
     
     const inputGain = document.getElementById("gain");
+    const inputDt = document.getElementById("dt");
+    const inputHorizon = document.getElementById("execution-horizon");
+    inputHorizon.addEventListener("change", async () => {{
+        const value = Number(inputHorizon.value);
+        if (!Number.isSafeInteger(value) || value <= 0) {{
+            inputHorizon.setCustomValidity("Enter a positive integer.");
+            inputHorizon.reportValidity();
+            return;
+        }}
+        inputHorizon.setCustomValidity("");
+        try {{
+            const response = await fetch("/api/execution-horizon", {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/json" }},
+                body: JSON.stringify({{ execution_horizon: value }}),
+            }});
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || "Unable to update execution horizon");
+            inputHorizon.value = result.execution_horizon;
+        }} catch (error) {{
+            inputHorizon.setCustomValidity(error.message);
+            inputHorizon.reportValidity();
+        }}
+    }});
+    inputDt.addEventListener("change", async () => {{
+        const value = Number(inputDt.value);
+        if (!Number.isFinite(value) || value <= 0) {{
+            inputDt.setCustomValidity("Enter a positive number of seconds.");
+            inputDt.reportValidity();
+            return;
+        }}
+        inputDt.setCustomValidity("");
+        try {{
+            const response = await fetch("/api/dt", {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/json" }},
+                body: JSON.stringify({{ dt: value }}),
+            }});
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || "Unable to update dt");
+            inputDt.value = result.dt;
+        }} catch (error) {{
+            inputDt.setCustomValidity(error.message);
+            inputDt.reportValidity();
+        }}
+    }});
     inputGain.addEventListener("change", () => {{
         const value = parseFloat(inputGain.value);
         if (!isNaN(value)) {{
@@ -204,12 +262,21 @@ _PAGE_TEMPLATE = """<!doctype html>
         }}
         lastInstanceId = s.instance_id;
         
-        if (s.awake) {{
+        if (s.initializing) {{
+            btnAwake.disabled = true;
+            btnAwake.textContent = "Waking...";
+        }} else if (s.awake) {{
             btnAwake.disabled = true;
             btnAwake.textContent = "Awakened";
+        }} else {{
+            btnAwake.disabled = false;
+            btnAwake.textContent = "Awake";
         }}
 
-        if (!s.started) {{
+        if (s.starting) {{
+            btnStart.textContent = "Starting...";
+            btnStart.disabled = true;
+        }} else if (!s.started) {{
             btnStart.textContent = "Start";
             btnStart.disabled = false;
         }} else if (s.paused) {{
@@ -230,6 +297,14 @@ _PAGE_TEMPLATE = """<!doctype html>
 
         if (document.activeElement !== inputGain) {{
             inputGain.value = s.gain;
+        }}
+        inputDt.disabled = s.dt === null;
+        inputHorizon.disabled = s.execution_horizon === null;
+        if (document.activeElement !== inputHorizon && s.execution_horizon !== null) {{
+            inputHorizon.value = s.execution_horizon;
+        }}
+        if (document.activeElement !== inputDt && s.dt !== null) {{
+            inputDt.value = s.dt;
         }}
 
         if (document.activeElement !== inputPrompt && s.language !== undefined) {{
@@ -301,6 +376,8 @@ class GUI(UI):
         self._status: Dict[str, Any] = {
             "instance_id": self._instance_id,
             "awake": False,
+            "initializing": False,
+            "starting": False,
             "started": False,
             "paused": False,
             "going_home": False,
@@ -320,7 +397,7 @@ class GUI(UI):
         self._poll_stop = threading.Event()
 
         self._player: Optional[Any] = None
-        self._awake_fired = False
+        self._awake_future: Optional[Future] = None
         self._start_fired = False
         self._state_series_logged = False
         self._action_series_logged = False
@@ -342,16 +419,14 @@ class GUI(UI):
     # trigger
     # ------------------------------------------------------------------ #
     def start(self) -> None:
-        if not self._awake_fired:
-            self.awake()
+        self.awake()
         with self._start_lock:
-            already = self._status["started"]
-            with self._status_lock:
-                self._status["started"] = True
+            if self._start_fired or self._player is None:
+                return
             self.clear_live_display()
-            if not already and self._display_active:
+            if self._display_active:
                 rr.log("/gui/events", rr.TextLog("Start triggered"))
-        super().start()
+            self._fire_player_start()
 
     def clear_live_display(self) -> None:
         if self._display_active:
@@ -370,9 +445,6 @@ class GUI(UI):
 
     def awake(self) -> None:
         self._fire_awake()
-        with self._status_lock:
-            self._status["awake"] = True
-        rr.log("/gui/events", rr.TextLog("Awake triggered"))
 
     
     def _pose_series_style(self, prefix: str, translation: bool) -> tuple[list[str], list[tuple[int, int, int]]]:
@@ -534,12 +606,33 @@ class GUI(UI):
         self._fire_player_unpause()
  
     def _fire_awake(self) -> None:
-        if self._awake_fired or self._player is None:
-            return
-        awake = getattr(self._player, "awake", None)
-        if callable(awake):
-            self._awake_fired = True
-            threading.Thread(target=awake, daemon=True, name="gui-player-awake").start()
+        with self._start_lock:
+            if self._player is None:
+                return
+            if self._awake_future is not None:
+                if not self._awake_future.done() or self._awake_future.exception() is None:
+                    return
+            awake = getattr(self._player, "awake", None)
+            if not callable(awake):
+                return
+            future = self._awake_future = Future()
+            with self._status_lock:
+                self._status["initializing"] = True
+
+            def initialize():
+                try:
+                    awake()
+                    with self._status_lock:
+                        self._status["awake"] = True
+                        self._status["initializing"] = False
+                    future.set_result(None)
+                except Exception as exc:
+                    with self._status_lock:
+                        self._status["initializing"] = False
+                    future.set_exception(exc)
+                    self.report_loop_event(f"Initialization failed: {exc}", level="warn")
+
+            threading.Thread(target=initialize, daemon=True, name="gui-player-awake").start()
 
     def _fire_player_start(self) -> None:
         if self._start_fired or self._player is None:
@@ -547,7 +640,33 @@ class GUI(UI):
         start = getattr(self._player, "start", None)
         if callable(start):
             self._start_fired = True
-            threading.Thread(target=start, daemon=True, name="gui-player-start").start()
+            with self._status_lock:
+                self._status["starting"] = True
+            awake_future = self._awake_future
+
+            def run_player():
+                try:
+                    # Player.awake() binds the client only after every camera
+                    # is ready. Start must wait for that whole operation.
+                    if awake_future is None:
+                        raise RuntimeError("Player initialization has not started")
+                    awake_future.result()
+                    with self._status_lock:
+                        self._status["starting"] = False
+                        self._status["started"] = True
+                    self._start_event.set()
+                    start()
+                except Exception as exc:
+                    with self._start_lock:
+                        self._start_fired = False
+                        with self._status_lock:
+                            self._status["starting"] = False
+                            self._status["started"] = False
+                            self._status["paused"] = False
+                        self._start_event.clear()
+                    self.report_loop_event(f"Player start failed: {exc}", level="warn")
+
+            threading.Thread(target=run_player, daemon=True, name="gui-player-start").start()
 
     def _fire_player_pause(self) -> None:
         if self._player is None:
@@ -797,6 +916,67 @@ class GUI(UI):
                 "inference/action_joint",
                 rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6, gripper]),
             )
+
+    def report_twist_command(
+        self, *, command_id: int, reference_frame: int, linear_velocity: list[float],
+        angular_velocity: list[float], duration: int, send_duration_ms: float,
+        result: str, succeeded: bool, error: Optional[str],
+    ) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/twist/command_id", rr.Scalars(command_id))
+        rr.log("inference/twist/reference_frame", rr.Scalars(reference_frame))
+        rr.log("inference/twist/linear_velocity_m_s", rr.Scalars(linear_velocity))
+        rr.log("inference/twist/angular_velocity", rr.Scalars(angular_velocity))
+        rr.log("inference/twist/duration", rr.Scalars(duration))
+        rr.log("inference/twist/send_duration_ms", rr.Scalars(send_duration_ms))
+        rr.log("inference/twist/send_result", rr.TextLog(f"command {command_id}: {result}"))
+        rr.log("inference/twist/send_succeeded", rr.Scalars(1.0 if succeeded else 0.0))
+        if error is not None:
+            rr.log("inference/twist/send_error", rr.TextLog(f"command {command_id}: {error}", level="error"))
+
+    def report_twist_feedback(
+        self, *, command_id: int, feedback_sequence: int, pose: "Pose", delay_ms: float,
+    ) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/twist_feedback/command_id", rr.Scalars(command_id))
+        rr.log("inference/twist_feedback/feedback_sequence", rr.Scalars(feedback_sequence))
+        rr.log("inference/twist_feedback/delay_ms", rr.Scalars(delay_ms))
+        rr.log("inference/twist_feedback/position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("inference/twist_feedback/orientation_wxyz", rr.Scalars([
+            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
+        ]))
+
+    def report_gripper_command(self, *, received: float, commanded: float) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/gripper_command/received", rr.Scalars(received))
+        rr.log("inference/gripper_command/commanded", rr.Scalars(commanded))
+
+    def report_waypoint_target(self, *, command_id: int, pose: "Pose") -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/waypoint/command_id", rr.Scalars(command_id))
+        rr.log("inference/waypoint/target_position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("inference/waypoint/target_orientation_wxyz", rr.Scalars([
+            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
+        ]))
+
+    def report_waypoint_result(
+        self, *, command_id: int, pose: "Pose", position_error_m: float,
+        orientation_error_deg: float, duration_ms: float,
+    ) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/waypoint/result_command_id", rr.Scalars(command_id))
+        rr.log("inference/waypoint/achieved_position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("inference/waypoint/achieved_orientation_wxyz", rr.Scalars([
+            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
+        ]))
+        rr.log("inference/waypoint/position_error_m", rr.Scalars(position_error_m))
+        rr.log("inference/waypoint/orientation_error_deg", rr.Scalars(orientation_error_deg))
+        rr.log("inference/waypoint/duration_ms", rr.Scalars(duration_ms))
     # ------------------------------------------------------------------ #
     # display setup
     # ------------------------------------------------------------------ #
@@ -871,7 +1051,7 @@ class GUI(UI):
                         ),
                         auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
                     )
-                case GrootConfig.THREE_TASKS_REL_ROT6D_LORA:
+                case GrootConfig.THREE_TASKS_REL_ROT6D_LORA | GrootConfig.EEF_ROT6D_ABS_IN_OUT:
                     return rrb.Blueprint(
                         rrb.Grid(
                             rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
@@ -994,6 +1174,11 @@ class GUI(UI):
     def _build_http_app(self) -> FastAPI:
         app = FastAPI()
 
+        def horizon_server():
+            client = getattr(self._player, "client", None) if self._player is not None else self.client
+            server = getattr(client, "server", None)
+            return server if hasattr(server, "execution_horizon") else None
+
         @app.get("/", response_class=HTMLResponse)
         def index():
             return self._render_page()
@@ -1011,7 +1196,17 @@ class GUI(UI):
         @app.get("/api/status")
         def api_status():
             with self._status_lock:
-                return JSONResponse(dict(self._status))
+                status = dict(self._status)
+            connection = self._player.connection if self._player is not None else self.connection
+            status["dt"] = connection.control_period_s if connection is not None else None
+            server = horizon_server()
+            status["execution_horizon"] = server.execution_horizon if server is not None else None
+            return JSONResponse(status)
+
+        @app.post("/api/prompt")
+        def api_prompt(payload: dict = Body(...)):
+            self.set_prompt(str(payload.get("prompt", "")))
+            return JSONResponse({"prompt": self.client.language})
 
         @app.post("/api/prompt")
         def api_prompt(payload: dict = Body(...)):
@@ -1043,6 +1238,31 @@ class GUI(UI):
             with self._status_lock:
                 self._status["gain"] = value
             return JSONResponse({"gain": value})
+
+        @app.post("/api/dt")
+        def api_dt(payload: dict = Body(...)):
+            try:
+                value = float(payload["dt"])
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return JSONResponse({"error": "dt must be a finite positive number of seconds"}, status_code=400)
+            connection = self._player.connection if self._player is not None else self.connection
+            if connection is None:
+                return JSONResponse({"error": "No robot connection is bound"}, status_code=409)
+            connection.control_period_s = value
+            return JSONResponse({"dt": value})
+
+        @app.post("/api/execution-horizon")
+        def api_execution_horizon(payload: dict = Body(...)):
+            value = payload.get("execution_horizon")
+            if type(value) is not int or value <= 0:
+                return JSONResponse({"error": "execution horizon must be a positive integer"}, status_code=400)
+            server = horizon_server()
+            if server is None:
+                return JSONResponse({"error": "No GR00T client is bound"}, status_code=409)
+            server.execution_horizon = value
+            return JSONResponse({"execution_horizon": value})
 
         return app
 
