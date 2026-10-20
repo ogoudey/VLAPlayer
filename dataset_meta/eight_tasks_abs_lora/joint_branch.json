@@ -1,0 +1,13 @@
+{
+  "period": 6.283185307179586,
+  "window_lo": [
+    -2.818468753491537,
+    -2.8347007671939295,
+    -6.614459848396027,
+    -5.040146803847993,
+    -3.3165321389781397,
+    -3.713935587798254,
+    -1.4942101259999951
+  ],
+  "usage": "training-time joint value = ((raw - window_lo) mod period) + window_lo, per joint. Stateless: no unwrapping over time is needed at inference. Verified to reproduce the per-episode unwrapped training values exactly."
+}
