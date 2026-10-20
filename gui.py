@@ -66,7 +66,7 @@ are None or don't implement these; the poller just skips them.
 """
 
 from __future__ import annotations
-
+from enum import Enum
 import threading
 from concurrent.futures import Future
 import math
@@ -74,7 +74,9 @@ import time
 import urllib.parse
 from typing import Any, Dict, Optional
 import uuid
-
+import json
+from pathlib import Path
+from fastapi import Body
 import rerun as rr
 import rerun.blueprint as rrb
 import uvicorn
@@ -96,7 +98,7 @@ _PAGE_TEMPLATE = """<!doctype html>
   .layout {{ display: flex; height: 100%; }}
   .viewer {{ flex: 1 1 auto; border: none; background: #000; }}
   .sidebar {{ width: 280px; flex: 0 0 auto; padding: 16px; box-sizing: border-box;
-              border-left: 1px solid #2a2d35; display: flex; flex-direction: column; gap: 14px; }}
+              border-left: 1px solid #2a2d35; display: flex; flex-direction: column; gap: 14px; overflow-y: auto;}}
   h1 {{ font-size: 15px; margin: 0 0 4px 0; color: #9aa4b2; font-weight: 600; }}
   .row {{ display: flex; justify-content: space-between; font-size: 13px; color: #c4c9d4; }}
   .row span:last-child {{ color: #fff; font-variant-numeric: tabular-nums; }}
@@ -143,6 +145,17 @@ _PAGE_TEMPLATE = """<!doctype html>
       <button id="start-btn">Start</button>
 
       <button id="gohome-btn" style="display:none; background:#6b5ce6;">Go To Home</button>
+      <div style="margin-top: auto; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid #2a2d35; padding-top: 14px;">
+        <label style="font-size: 13px; color: #c4c9d4;">episode annotation
+            <select id="episode-annotation" style="padding: 10px; font-size: 14px; border-radius: 6px; border: 1px solid #2a2d35;
+                    background: #1a1d24; color: #fff; box-sizing: border-box; width: 100%; margin-top: 4px;">
+            <option value="success">success</option>
+            <option value="failure">failure</option>
+            </select>
+        </label>
+        <button id="save-episode-btn" style="background:#2f9e68;">Save Episode</button>
+        <div id="save-episode-status" style="font-size: 12px; color: #9aa4b2;"></div>
+        </div>
     </div>
   </div>
   <script>
@@ -241,6 +254,24 @@ _PAGE_TEMPLATE = """<!doctype html>
       }});
     }});
 
+    const btnSave = document.getElementById("save-episode-btn");
+    const selAnnotation = document.getElementById("episode-annotation");
+    const saveStatus = document.getElementById("save-episode-status");
+
+    btnSave.addEventListener("click", () => {{
+    btnSave.disabled = true;
+    saveStatus.textContent = "Saving...";
+    fetch("/api/save_episode", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ episode_annotation: selAnnotation.value }}),
+    }})
+        .then(r => r.json())
+        .then(d => {{ saveStatus.textContent = d.saved ? ("Saved: " + d.saved) : ("Error: " + d.error); }})
+        .catch(() => {{ saveStatus.textContent = "Save failed"; }})
+        .finally(() => {{ btnSave.disabled = false; }});
+    }});
+
     const btnGoHome = document.getElementById("gohome-btn");
         btnGoHome.addEventListener("click", () => {{
         btnGoHome.disabled = true;
@@ -272,7 +303,7 @@ _PAGE_TEMPLATE = """<!doctype html>
             btnAwake.disabled = false;
             btnAwake.textContent = "Awake";
         }}
-
+        
         if (s.starting) {{
             btnStart.textContent = "Starting...";
             btnStart.disabled = true;
@@ -286,7 +317,7 @@ _PAGE_TEMPLATE = """<!doctype html>
             btnStart.textContent = "Pause";
             btnStart.disabled = false;
         }}
-
+        btnSave.disabled = s.started && !s.paused;
         if (s.started) {{
             btnGoHome.style.display = "block";
             btnGoHome.disabled = s.going_home;
@@ -335,8 +366,10 @@ _PAGE_TEMPLATE = """<!doctype html>
 </html>
 """
 
+EPISODE_ANNOTATIONS = ("success", "failure")
 
 class GUI(UI):
+    
     AXIS_COLORS = {
         "x": (230, 25, 75), # red
         "y": (60, 180, 75), # green
@@ -345,6 +378,17 @@ class GUI(UI):
         "theta_y": (60, 180, 75), # green
         "theta_z": (66, 212, 244), # blue
     }
+
+    _STATE_VIEWS = [
+            ("state/pose/position", "State -- Position"),
+            ("state/pose/orientation", "State -- Orientation"),
+            ("state/gripper", "State -- Gripper"),
+    ]
+    _COMMON_VIEWS = [
+        ("inference/queue_depth", "Queue Depth"),
+        ("inference/loop_drift_ms", "Loop Drift"),
+        ("client/latency_ms", "Prediction Latency"),
+    ]
     def __init__(
         self,
         headless: bool = True,
@@ -357,7 +401,8 @@ class GUI(UI):
         app_id: str = "policy-inference-gui",
         poll_hz: float = 10.0,
         client_setting: Optional[str] = None,
-        recording_path: str = "data"
+        recording_path: str = "data", # redund?
+        episodes_dir: str = "episodes"
     ):
         # IMPORTANT: UI.__init__ may call self.start() synchronously (when
         # direct_start=True), and that call lands on GUI.start() below via
@@ -405,6 +450,14 @@ class GUI(UI):
         self._loop_timing_series_logged = False
         self._client_latency_series_logged = False
 
+        self._episodes_root = Path(episodes_dir)
+        self._episode_lock = threading.Lock()
+        self._server_rec = None
+        self._server_uri: Optional[str] = None
+        self._episode_rec = None
+        self._episode_dir: Optional[Path] = None
+        self._episode_started_at: Optional[float] = None
+        self._view_start_s: Optional[float] = None
         super().__init__(headless=headless, direct_start=direct_start)
 
         if not self.headless:
@@ -565,7 +618,7 @@ class GUI(UI):
         self.client.language = prompt
         self.report_loop_event(f"Prompt changed: {prompt!r}")  # prints and logs to inference/events
         if self._display_active:
-            rr.log("/language", rr.TextDocument(prompt))
+            rr.log("language", rr.TextDocument(prompt))
 
     # ------------------------------------------------------------------ #
     # start / pause / unpause — the Start button becomes a pause toggle
@@ -654,6 +707,7 @@ class GUI(UI):
                     with self._status_lock:
                         self._status["starting"] = False
                         self._status["started"] = True
+                    self._begin_episode()
                     self._start_event.set()
                     start()
                 except Exception as exc:
@@ -676,6 +730,7 @@ class GUI(UI):
             threading.Thread(target=pause, daemon=True, name="gui-player-pause").start()
 
     def _fire_player_unpause(self) -> None:
+        self._begin_episode()
         if self._player is None:
             return
         unpause = getattr(self._player, "unpause", None)
@@ -756,7 +811,7 @@ class GUI(UI):
         if not self._display_active or not self._actively_predicting:
             return
         if frame is not None:
-            rr.log(f"cameras/{camera_id}", rr.Image(frame))
+            rr.log(f"cameras/{camera_id}", rr.Image(frame))   # was f"cameras/{camera_id}"
 
     def report_loop_event(self, message: str, level: str = "info") -> None:
         """Annotated timeline events — chunk arrivals, failures, skips — so
@@ -764,6 +819,102 @@ class GUI(UI):
         print(f"[inference] {message}")
         if self._display_active or not self._actively_predicting:
             rr.log("inference/events", rr.TextLog(message, level=level))
+
+    def report_applied_action(self, action: "Action") -> None:
+            if not self._display_active or not self._actively_predicting:
+                return
+            if isinstance(action, CartesianDelta):
+                gripper = action.gripper_command if action.gripper_command is not None else float("nan")
+                self._log_action_cartesian_delta()
+                rr.log("inference/action_delta/position", rr.Scalars([action.dx, action.dy, action.dz]))
+                rr.log("inference/action_delta/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
+                rr.log("inference/gripper", rr.Scalars(gripper))
+            elif isinstance(action, ObservationRelativeDelta):
+                gripper = action.gripper_obs_rel_delta if action.gripper_obs_rel_delta is not None else float("nan")
+                self._log_action_obs_relative_delta()
+                rr.log("inference/obs_rel_delta/position", rr.Scalars([action.dx, action.dy, action.dz]))
+                rr.log("inference/obs_rel_delta/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
+                rr.log("inference/obs_rel_delta/gripper", rr.Scalars(gripper))
+            elif isinstance(action, PoseTarget):
+                self._log_action_target_pose()
+                rr.log("inference/action_target_pose/position", rr.Scalars([action.x, action.y, action.z]))
+                rr.log("inference/action_target_pose/orientation", rr.Scalars([action.theta_w, action.theta_x, action.theta_y, action.theta_z]))
+                rr.log("inference/gripper", rr.Scalars(action.gripper_command))
+            elif isinstance(action, JointDelta):
+                self._log_action_joint_deltas()
+                rr.log("inference/action_joint_deltas/position", rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6]))
+                rr.log("inference/action_joint_deltas/gripper", rr.Scalars(gripper))
+            elif isinstance(action, JointAngles):
+                self._log_action_joint_angles()
+                rr.log("inference/action_joint_angles/joint_angles", rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6]))
+                rr.log("inference/action_joint_angles/gripper", rr.Scalars(gripper))
+            elif isinstance(action, JointVelocities7DOF):
+                self._log_action_joint_velocities()
+                rr.log(
+                    "inference/action_joint",
+                    rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6, gripper]),
+                )
+
+    def report_twist_command(
+        self, *, command_id: int, reference_frame: int, linear_velocity: list[float],
+        angular_velocity: list[float], duration: int, send_duration_ms: float,
+        result: str, succeeded: bool, error: Optional[str],
+    ) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/twist/command_id", rr.Scalars(command_id))
+        rr.log("inference/twist/reference_frame", rr.Scalars(reference_frame))
+        rr.log("inference/twist/linear_velocity_m_s", rr.Scalars(linear_velocity))
+        rr.log("inference/twist/angular_velocity", rr.Scalars(angular_velocity))
+        rr.log("inference/twist/duration", rr.Scalars(duration))
+        rr.log("inference/twist/send_duration_ms", rr.Scalars(send_duration_ms))
+        rr.log("inference/twist/send_result", rr.TextLog(f"command {command_id}: {result}"))
+        rr.log("inference/twist/send_succeeded", rr.Scalars(1.0 if succeeded else 0.0))
+        if error is not None:
+            rr.log("inference/twist/send_error", rr.TextLog(f"command {command_id}: {error}", level="error"))
+    
+    def report_twist_feedback(
+        self, *, command_id: int, feedback_sequence: int, pose: "Pose", delay_ms: float,
+    ) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/twist_feedback/command_id", rr.Scalars(command_id))
+        rr.log("inference/twist_feedback/feedback_sequence", rr.Scalars(feedback_sequence))
+        rr.log("inference/twist_feedback/delay_ms", rr.Scalars(delay_ms))
+        rr.log("inference/twist_feedback/position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("inference/twist_feedback/orientation_wxyz", rr.Scalars([
+            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
+        ]))
+
+    def report_gripper_command(self, *, received: float, commanded: float) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/gripper_command/received", rr.Scalars(received))
+        rr.log("inference/gripper_command/commanded", rr.Scalars(commanded))
+
+    def report_waypoint_target(self, *, command_id: int, pose: "Pose") -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/waypoint/command_id", rr.Scalars(command_id))
+        rr.log("inference/waypoint/target_position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("inference/waypoint/target_orientation_wxyz", rr.Scalars([
+            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
+        ]))
+
+    def report_waypoint_result(
+        self, *, command_id: int, pose: "Pose", position_error_m: float,
+        orientation_error_deg: float, duration_ms: float,
+    ) -> None:
+        if not self._display_active:
+            return
+        rr.log("inference/waypoint/result_command_id", rr.Scalars(command_id))
+        rr.log("inference/waypoint/achieved_position", rr.Scalars([pose.x, pose.y, pose.z]))
+        rr.log("inference/waypoint/achieved_orientation_wxyz", rr.Scalars([
+            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
+        ]))
+        rr.log("inference/waypoint/position_error_m", rr.Scalars(position_error_m))
+        rr.log("inference/waypoint/orientation_error_deg", rr.Scalars(orientation_error_deg))
+        rr.log("inference/waypoint/duration_ms", rr.Scalars(duration_ms))
 
     def _log_action_cartesian_delta(self) -> None:
         if self._action_series_logged:
@@ -879,121 +1030,26 @@ class GUI(UI):
         )
 
 
-    def report_applied_action(self, action: "Action") -> None:
-        if not self._display_active or not self._actively_predicting:
-            return
-
-        
-
-        if isinstance(action, CartesianDelta):
-            gripper = action.gripper_command if action.gripper_command is not None else float("nan")
-            self._log_action_cartesian_delta()
-            rr.log("inference/action_delta/position", rr.Scalars([action.dx, action.dy, action.dz]))
-            rr.log("inference/action_delta/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
-            rr.log("inference/gripper", rr.Scalars(gripper))
-        elif isinstance(action, ObservationRelativeDelta):
-            gripper = action.gripper_obs_rel_delta if action.gripper_obs_rel_delta is not None else float("nan")
-            self._log_action_obs_relative_delta()
-            rr.log("inference/obs_rel_delta/position", rr.Scalars([action.dx, action.dy, action.dz]))
-            rr.log("inference/obs_rel_delta/orientation", rr.Scalars([action.d_theta_x, action.d_theta_y, action.d_theta_z]))
-            rr.log("inference/obs_rel_delta/gripper", rr.Scalars(gripper))
-        elif isinstance(action, PoseTarget):
-            self._log_action_target_pose()
-            rr.log("inference/action_target_pose/position", rr.Scalars([action.x, action.y, action.z]))
-            rr.log("inference/action_target_pose/orientation", rr.Scalars([action.theta_w, action.theta_x, action.theta_y, action.theta_z]))
-            rr.log("inference/gripper", rr.Scalars(action.gripper_command))
-        elif isinstance(action, JointDelta):
-            self._log_action_joint_deltas()
-            rr.log("inference/action_joint_deltas/position", rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6]))
-            rr.log("inference/action_joint_deltas/gripper", rr.Scalars(gripper))
-        elif isinstance(action, JointAngles):
-            self._log_action_joint_angles()
-            rr.log("inference/action_joint_angles/joint_angles", rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6]))
-            rr.log("inference/action_joint_angles/gripper", rr.Scalars(gripper))
-        elif isinstance(action, JointVelocities7DOF):
-            self._log_action_joint_velocities()
-            rr.log(
-                "inference/action_joint",
-                rr.Scalars([action.j0, action.j1, action.j2, action.j3, action.j4, action.j5, action.j6, gripper]),
-            )
-
-    def report_twist_command(
-        self, *, command_id: int, reference_frame: int, linear_velocity: list[float],
-        angular_velocity: list[float], duration: int, send_duration_ms: float,
-        result: str, succeeded: bool, error: Optional[str],
-    ) -> None:
-        if not self._display_active:
-            return
-        rr.log("inference/twist/command_id", rr.Scalars(command_id))
-        rr.log("inference/twist/reference_frame", rr.Scalars(reference_frame))
-        rr.log("inference/twist/linear_velocity_m_s", rr.Scalars(linear_velocity))
-        rr.log("inference/twist/angular_velocity", rr.Scalars(angular_velocity))
-        rr.log("inference/twist/duration", rr.Scalars(duration))
-        rr.log("inference/twist/send_duration_ms", rr.Scalars(send_duration_ms))
-        rr.log("inference/twist/send_result", rr.TextLog(f"command {command_id}: {result}"))
-        rr.log("inference/twist/send_succeeded", rr.Scalars(1.0 if succeeded else 0.0))
-        if error is not None:
-            rr.log("inference/twist/send_error", rr.TextLog(f"command {command_id}: {error}", level="error"))
-
-    def report_twist_feedback(
-        self, *, command_id: int, feedback_sequence: int, pose: "Pose", delay_ms: float,
-    ) -> None:
-        if not self._display_active:
-            return
-        rr.log("inference/twist_feedback/command_id", rr.Scalars(command_id))
-        rr.log("inference/twist_feedback/feedback_sequence", rr.Scalars(feedback_sequence))
-        rr.log("inference/twist_feedback/delay_ms", rr.Scalars(delay_ms))
-        rr.log("inference/twist_feedback/position", rr.Scalars([pose.x, pose.y, pose.z]))
-        rr.log("inference/twist_feedback/orientation_wxyz", rr.Scalars([
-            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
-        ]))
-
-    def report_gripper_command(self, *, received: float, commanded: float) -> None:
-        if not self._display_active:
-            return
-        rr.log("inference/gripper_command/received", rr.Scalars(received))
-        rr.log("inference/gripper_command/commanded", rr.Scalars(commanded))
-
-    def report_waypoint_target(self, *, command_id: int, pose: "Pose") -> None:
-        if not self._display_active:
-            return
-        rr.log("inference/waypoint/command_id", rr.Scalars(command_id))
-        rr.log("inference/waypoint/target_position", rr.Scalars([pose.x, pose.y, pose.z]))
-        rr.log("inference/waypoint/target_orientation_wxyz", rr.Scalars([
-            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
-        ]))
-
-    def report_waypoint_result(
-        self, *, command_id: int, pose: "Pose", position_error_m: float,
-        orientation_error_deg: float, duration_ms: float,
-    ) -> None:
-        if not self._display_active:
-            return
-        rr.log("inference/waypoint/result_command_id", rr.Scalars(command_id))
-        rr.log("inference/waypoint/achieved_position", rr.Scalars([pose.x, pose.y, pose.z]))
-        rr.log("inference/waypoint/achieved_orientation_wxyz", rr.Scalars([
-            pose.theta_w, pose.theta_x, pose.theta_y, pose.theta_z,
-        ]))
-        rr.log("inference/waypoint/position_error_m", rr.Scalars(position_error_m))
-        rr.log("inference/waypoint/orientation_error_deg", rr.Scalars(orientation_error_deg))
-        rr.log("inference/waypoint/duration_ms", rr.Scalars(duration_ms))
+    
     # ------------------------------------------------------------------ #
     # display setup
     # ------------------------------------------------------------------ #
     def _launch_display(self, recording_path: str) -> None:
         rr.init(self._app_id, spawn=False)
         rr.save(recording_path)
-        server_uri = rr.serve_grpc(
+
+        self._server_rec = rr.get_global_data_recording()
+        self._server_uri = server_uri = rr.serve_grpc(
             grpc_port=self._grpc_port,
-            server_memory_limit="200MB",
-            default_blueprint=self._build_blueprint(),
+            server_memory_limit="1000MB",
         )
+        rr.send_blueprint(self._build_blueprint())
         try:
-            rr.serve_web_viewer(open_browser=False, web_port=self._web_port, connect_to=server_uri)
+            rr.serve_web_viewer(open_browser=False, web_port=self._web_port, connect_to=self._server_uri)
         except TypeError:
             # Older/newer SDKs may name these kwargs differently — fall back
             # to the minimal call and rely on the ?url= query param below.
-            rr.serve_web_viewer(open_browser=False, connect_to=server_uri)
+            rr.serve_web_viewer(open_browser=False, connect_to=self._server_uri)
 
         self._viewer_url = (
             f"http://{self._host}:{self._web_port}/?url={urllib.parse.quote(server_uri, safe='')}"
@@ -1018,151 +1074,129 @@ class GUI(UI):
 
     
 
+    
+
+    def _action_views(self) -> list[tuple[str, str]]:
+        match self.client_setting:
+            case (GrootConfig.THREE_TASKS_2_ABS_DELTAS_LORA
+                  | GrootConfig.THREE_TASKS_2_FIXED_LORA
+                  | GrootConfig.THREE_TASKS_ABS_DELTAS_LORA):
+                return [
+                    ("inference/action_delta/position", "Action -- Position"),
+                    ("inference/action_delta/orientation", "Action -- Orientation"),
+                    ("inference/gripper", "Action -- Gripper"),
+                ]
+            case GrootConfig.THREE_TASKS_REL_ROT6D_LORA | GrootConfig.EEF_ROT6D_ABS_IN_OUT:
+                return [
+                    ("inference/action_target_pose/position", "Action -- Position"),
+                    ("inference/action_target_pose/orientation", "Action -- Orientation"),
+                    ("inference/gripper", "Action -- Gripper"),
+                ]
+            case GrootConfig.ABL6_EEFSRC_FULLSTATE:
+                return [
+                    ("inference/action_target_pose/position", "Action -- Position Delta"),
+                    ("inference/action_target_pose/orientation", "Action -- Orientation Delta"),
+                    ("inference/gripper", "Action -- Gripper"),
+                ]
+            case GrootConfig.ABS_ROT6D_LORA:
+                return [
+                    ("inference/target_pose/position", "Action -- Position"),
+                    ("inference/target_pose/orientation", "Action -- Orientation"),
+                    ("inference/gripper", "Action -- Gripper"),
+                ]
+            case _:
+                return []  # unknown config: state + common views only; auto_views still picks up the rest
+
+    def _ts_view(self, origin: str, name: str) -> rrb.TimeSeriesView:
+        """A time-series view that, after a Save, only shows data from that moment on."""
+        kwargs = {}
+        if self._view_start_s is not None:
+            kwargs["time_ranges"] = rrb.VisibleTimeRange(
+                "log_time",
+                start=rrb.TimeRangeBoundary.absolute(seconds=self._view_start_s),
+                end=rrb.TimeRangeBoundary.cursor_relative(seconds=0),
+            )
+        return rrb.TimeSeriesView(origin=origin, name=name, **kwargs)
+
     def _build_blueprint(self) -> rrb.Blueprint:
-        if isinstance(self.client_setting, GrootConfig):
-            match self.client_setting:
-                case GrootConfig.THREE_TASKS_2_ABS_DELTAS_LORA | GrootConfig.THREE_TASKS_2_FIXED_LORA:
-                    return rrb.Blueprint(
-                        rrb.Grid(
-                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
-                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
-                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_delta/position", name="Action -- Position"),
-                            rrb.TimeSeriesView(origin="inference/action_delta/orientation", name="Action -- Orientation"),
-                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                        ),
-                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                    )
-                case GrootConfig.THREE_TASKS_ABS_DELTAS_LORA:
-                    return rrb.Blueprint(
-                        rrb.Grid(
-                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
-                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
-                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_delta/position", name="Action -- Position"),
-                            rrb.TimeSeriesView(origin="inference/action_delta/orientation", name="Action -- Orientation"),
-                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                        ),
-                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                    )
-                case GrootConfig.THREE_TASKS_REL_ROT6D_LORA | GrootConfig.EEF_ROT6D_ABS_IN_OUT:
-                    return rrb.Blueprint(
-                        rrb.Grid(
-                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
-                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
-                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Position"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Orientation"),
-                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                        ),
-                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                    )
-                case GrootConfig.ABL6_EEFSRC_FULLSTATE:
-                    # Define the blueprint for this setting
-                    return rrb.Blueprint(
-                        rrb.Grid(
-                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
-                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
-                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Position Delta"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Orientation Delta"),
-                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                        ),
-                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                    )
-                case GrootConfig.ABS_ROT6D_LORA:
-                    return rrb.Blueprint(
-                        rrb.Grid(
-                            rrb.TimeSeriesView(origin="state/pose/position", name="State -- Position"),
-                            rrb.TimeSeriesView(origin="state/pose/orientation", name="State -- Orientation"),
-                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/target_pose/position", name="Action -- Position"),
-                            rrb.TimeSeriesView(origin="inference/target_pose/orientation", name="Action -- Orientation"),
-                            rrb.TimeSeriesView(origin="inference/gripper", name="Action -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                        ),
-                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                    )
-        else:
-            match self.client_setting:
-                case "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT":
-                    # Define the blueprint for this setting
-                    return rrb.Blueprint(
-                        rrb.Grid(
-                            rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
-                            rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
-                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Target Pose Position"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Target Pose Orientation"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/gripper", name="Action -- Target Pose Gripper"),
-                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                        ),
-                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                    )
-                case "OLD_NEW_EMBODIMENT":
-                    # Define the blueprint for this setting
-                    return rrb.Blueprint(
-                        rrb.Grid(
-                            rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
-                            rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
-                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_cartesian/position", name="Action -- Target Pose Position"),
-                            rrb.TimeSeriesView(origin="inference/action_cartesian/orientation", name="Action -- Target Pose Orientation"),
-                            rrb.TimeSeriesView(origin="inference/action_cartesian/gripper", name="Action -- Target Pose Gripper"),
-                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                        ),
-                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                    )
-                case "NEW_EMBODIMENT":
-                    # Define the blueprint for this setting
-                    return rrb.Blueprint(
-                        rrb.Grid(
-                            rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
-                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_joint_angles/joint_angles", name="Action -- Joint Angles"),
-                            rrb.TimeSeriesView(origin="inference/action_joint_angles/gripper", name="Action --  Gripper"),
-                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                        ),
-                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                    )
-                case _, None:
-                    return rrb.Blueprint(
-                        rrb.Grid(
-                            
-                            rrb.TimeSeriesView(origin="state/target_pose/position", name="State -- Target Pose Position"),
-                            rrb.TimeSeriesView(origin="state/target_pose/orientation", name="State -- Target Pose Orientation"),
-                            rrb.TimeSeriesView(origin="state/joint_angles", name="State -- Joint Angles"),
-                            rrb.TimeSeriesView(origin="state/gripper", name="State -- Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/position", name="Action -- Target Pose Position"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/orientation", name="Action -- Target Pose Orientation"),
-                            rrb.TimeSeriesView(origin="inference/action_target_pose/gripper", name="Action -- Target Pose Gripper"),
-                            rrb.TimeSeriesView(origin="inference/action_joint", name="Action -- Joint"),
-                            rrb.TimeSeriesView(origin="inference/queue_depth", name="Queue Depth"),
-                            rrb.TimeSeriesView(origin="inference/loop_drift_ms", name="Loop Drift"),
-                            rrb.TimeSeriesView(origin="client/latency_ms", name="Prediction Latency"),
-                        ),
-                        auto_views=True,  # still auto-add anything not listed above (camera feeds, the 3D transform, text log)
-                    )
+        views = self._STATE_VIEWS + self._action_views() + self._COMMON_VIEWS
+        children = [self._ts_view(origin, name) for origin, name in views]
+
+        # One 2D view per camera, each rooted at exactly that camera's entity,
+        # so the two images can't be drawn into the same view.
+        for cam in getattr(self.camera_set, "camera_connections", None) or []:
+            cam_id = getattr(cam, "id", None) or str(id(cam))
+            children.append(rrb.Spatial2DView(origin=f"cameras/{cam_id}", name=f"Camera -- {cam_id}"))
+
+        return rrb.Blueprint(
+            rrb.Grid(*children),
+            auto_views=True,
+        )
+
+    def _begin_episode(self) -> None:
+        episode_tag = uuid.uuid4().hex[:8]
+        episode_dir = self._episodes_root / f"{time.strftime('%Y%m%d_%H%M%S')}_{episode_tag}"
+        episode_dir.mkdir(parents=True, exist_ok=True)
+
+        self._view_start_s = time.time()   # plots (live and in the file) start where this episode starts
+
+        rec = rr.RecordingStream(self._app_id, recording_id=self._server_rec.get_recording_id())
+        rec.set_sinks(
+            rr.GrpcSink(self._server_uri),
+            rr.FileSink(str(episode_dir / "rollout.rrd")),
+        )
+        rec.send_blueprint(self._build_blueprint())  # make_active=True: replaces the layout the viewer remembers
+        rr.set_global_data_recording(rec)
+
+        # The live view used to "clear" by switching recordings; now that it's
+        # one continuous recording, clear it explicitly at each episode boundary.
+        print("BEgin episode! Clearing data...")
+        rr.log("/", rr.Clear(recursive=True))
+
+        self._episode_rec = rec
+        self._episode_dir = episode_dir
+        self._episode_started_at = time.time()
+
+        # Static styling (SeriesLines) is per-recording: re-send it in the new one.
+        self._state_series_logged = False
+        self._action_series_logged = False
+        self._queue_depth_series_logged = False
+        self._loop_timing_series_logged = False
+        self._client_latency_series_logged = False
+        rr.log("language", rr.TextDocument(self.language))
+
+    def save_episode(self, annotation: str) -> Path:
+        with self._episode_lock:
+            old_rec, old_dir, started_at = self._episode_rec, self._episode_dir, self._episode_started_at
+            rr.set_global_data_recording(self._server_rec)
+        self._reset_live_view()
+        old_rec.flush(timeout_sec=10)
+        old_rec.disconnect()  # closes the file sink
+
+        setting = self.client_setting
+
+        ended_at = time.time()
+        metadata = {
+            "episode_annotation": annotation,
+            "language": self.language,
+            "client_setting": setting.value if isinstance(setting, Enum) else setting,
+            "gain": getattr(self, "gain", None),
+            "recording_id": old_rec.get_recording_id(),
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_s": ended_at - started_at,
+        }
+        (old_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+        self.report_loop_event(f"Saved episode ({annotation}) -> {old_dir}")
+        
+        return old_dir
+
+    def _reset_live_view(self) -> None:
+        if not self._display_active:
+            return
+        self._view_start_s = time.time()
+        rr.log("/", rr.Clear(recursive=True))     # images, text, transforms
+        rr.send_blueprint(self._build_blueprint())  # plots now start at this moment
 
     def _wait_for_serving_then_awake(self, timeout: float = 10.0) -> None:
         deadline = time.time() + timeout
@@ -1222,9 +1256,18 @@ class GUI(UI):
             with self._status_lock:
                 return JSONResponse({"started": self._status["started"], "paused": self._status["paused"]})
 
+        @app.post("/api/save_episode")
+        def api_save_episode(payload: dict = Body(...)):
+            annotation = payload.get("episode_annotation")
+            if annotation not in EPISODE_ANNOTATIONS:
+                return JSONResponse({"error": f"annotation must be one of {EPISODE_ANNOTATIONS}"}, status_code=400)
+            saved_dir = self.save_episode(annotation)
+            return JSONResponse({"saved": str(saved_dir)})
+
         @app.post("/api/go_home")
         def api_go_home():
             self.go_home()
+            
             with self._status_lock:
                 return JSONResponse({"going_home": self._status["going_home"]})
 

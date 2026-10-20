@@ -6,7 +6,7 @@ from pathlib import Path
 parser = argparse.ArgumentParser()
 parser.add_argument("recording_path", nargs="?", help="Rerun recording output")
 parser.add_argument("--config", default="EEF_ROT6D_ABS_IN_OUT", help="GrootConfig enum name for live inference")
-parser.add_argument("--joint-branch", type=Path, default="dataset_meta/three_tasks_tomato_eggplant_pineapple/joint_branch.json",help="Path to joint_branch.json (required for rot6D configs)")
+parser.add_argument("--joint-branch", type=Path, default="dataset_meta/eight_tasks_abs_lora/joint_branch.json",help="Path to joint_branch.json (required for rot6D configs)")
 parser.add_argument("--q-ref", type=Path, help="Path to q_ref.json (required for quaternion configs)")
 parser.add_argument("--execution", choices=("tidybot", "waypoint", "delta"),
                     default="tidybot",

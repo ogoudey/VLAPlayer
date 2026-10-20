@@ -110,7 +110,8 @@ class TidybotInterface(Connection):
                 raise ValueError(f"Gripper target must be finite; got {gripper!r}")
             commanded_gripper = float(np.clip(gripper, 0.0, 1.0))
             if commanded_gripper != gripper:
-                print(f"[tidybot gripper] received={gripper!r}, clamped={commanded_gripper!r}")
+                #print(f"[tidybot gripper] received={gripper!r}, clamped={commanded_gripper!r}")
+                pass
             report = getattr(self.ui, "report_gripper_command", None)
             if callable(report):
                 report(received=gripper, commanded=commanded_gripper)
